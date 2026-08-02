@@ -4,7 +4,6 @@
 #include <mach-o/dyld.h>
 #include <mach-o/dyld_priv.h>
 #include <mach-o/loader.h>
-#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <errno.h>
@@ -23,32 +22,6 @@ int   dladdr(const void *addr, Dl_info *info) { (void)addr; (void)info; return 0
  * only the ARM/PowerPC variants of this function do real cache-line
  * flush instructions). */
 void sys_icache_invalidate(const void *addr, size_t len) { (void)addr; (void)len; }
-
-/* Real Darwin's dyld walks every loaded image to find whichever one
- * contains `addr`. We have no dyld and exactly one, statically-linked
- * image, so `addr` is always inside it -- libunwind (both our runtime
- * copy and ld64's own vendored parser) needs this to locate the
- * unwind-info sections for exception handling / stack walking. ld64
- * itself synthesizes both the section$start$/section$end$ symbols and
- * _mh_execute_header for MH_EXECUTE outputs, so these always resolve
- * (to a zero-length range if a binary happens to have no such section). */
-extern struct mach_header _mh_execute_header;
-extern const char __unwind_info_start__[] __asm("section$start$__TEXT$__unwind_info");
-extern const char __unwind_info_end__[] __asm("section$end$__TEXT$__unwind_info");
-extern const char __eh_frame_start__[] __asm("section$start$__TEXT$__eh_frame");
-extern const char __eh_frame_end__[] __asm("section$end$__TEXT$__eh_frame");
-
-bool
-_dyld_find_unwind_sections(void *addr, struct dyld_unwind_sections *info)
-{
-	(void)addr;
-	info->mh = &_mh_execute_header;
-	info->dwarf_section = __eh_frame_start__;
-	info->dwarf_section_length = (uintptr_t)(__eh_frame_end__ - __eh_frame_start__);
-	info->compact_unwind_section = __unwind_info_start__;
-	info->compact_unwind_section_length = (uintptr_t)(__unwind_info_end__ - __unwind_info_start__);
-	return true;
-}
 
 #include <mach/mach.h>
 #include <mach/mach_host.h>

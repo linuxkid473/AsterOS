@@ -30,9 +30,32 @@ mformat -i "$ROOTFS_IMG" -R 8 -c 8 -r 32 -h 16 -n 63 -v ROOTFS ::
 for d in bin sbin dev etc tmp usr var; do
 	mmd -i "$ROOTFS_IMG" "::/$d"
 done
+mmd -i "$ROOTFS_IMG" ::/usr/lib
 
 mcopy -i "$ROOTFS_IMG" src/busybox/busybox_unstripped ::/bin/busybox
 mcopy -i "$ROOTFS_IMG" build/init_launcher/init ::/sbin/init
+
+DYLD_BIN="build/dyld_obj/dyld"
+LIBSYSTEM_REAL="build/libSystem_obj/libSystem.B.dylib"
+LIBSYSTEM_PLACEHOLDER="build/dyld_obj/libSystem.B.dylib"
+if [ -f "$DYLD_BIN" ]; then
+	echo "dyld found in build/ -- including it in the rootfs"
+	mcopy -i "$ROOTFS_IMG" "$DYLD_BIN" ::/usr/lib/dyld
+	if [ -f "$LIBSYSTEM_REAL" ]; then
+		echo "real libSystem.B.dylib found in build/ -- including it in the rootfs"
+		mcopy -i "$ROOTFS_IMG" "$LIBSYSTEM_REAL" ::/usr/lib/libSystem.B.dylib
+		mcopy -i "$ROOTFS_IMG" build/libSystem_obj/libSystem_selflink_stub.dylib ::/usr/lib/libSystem_selflink_stub.dylib
+		if [ -f build/libSystem_obj/systest ]; then
+			mcopy -i "$ROOTFS_IMG" build/libSystem_obj/systest ::/bin/systest
+		fi
+	elif [ -f "$LIBSYSTEM_PLACEHOLDER" ]; then
+		mcopy -i "$ROOTFS_IMG" "$LIBSYSTEM_PLACEHOLDER" ::/usr/lib/libSystem.B.dylib
+	fi
+	if [ -f build/dyld_obj/libtest.dylib ] && [ -f build/dyld_obj/dyntest ]; then
+		mcopy -i "$ROOTFS_IMG" build/dyld_obj/libtest.dylib ::/usr/lib/libtest.dylib
+		mcopy -i "$ROOTFS_IMG" build/dyld_obj/dyntest ::/bin/dyntest
+	fi
+fi
 
 if [ -x "$CLANG_BIN" ] && [ -x "$LD_BIN" ] && [ -f "$LIBCXX" ] && [ -f "$LIBCXXABI" ] \
     && [ -f "$LIBUNWIND" ] && [ -f "$CLANGRT" ]; then
@@ -43,7 +66,6 @@ if [ -x "$CLANG_BIN" ] && [ -x "$LD_BIN" ] && [ -f "$LIBCXX" ] && [ -f "$LIBCXXA
 	ar rcs build/libc_obj/libc.a build/libc_obj/*.o
 
 	mmd -i "$ROOTFS_IMG" ::/usr/bin
-	mmd -i "$ROOTFS_IMG" ::/usr/lib
 	mmd -i "$ROOTFS_IMG" ::/usr/include
 
 	mcopy -i "$ROOTFS_IMG" "$CLANG_BIN" ::/usr/bin/clang

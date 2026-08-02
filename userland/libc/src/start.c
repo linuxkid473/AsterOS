@@ -1,6 +1,10 @@
-/* __libc_start: called from crt0.S with the raw argc/argv/envp off the
- * initial stack (see crt0.S). Sets up `environ`, calls main(), then
- * exit()s with its return value -- the standard crt0 contract. */
+/* Runtime support __libc_start (crt0.S's callee) needs: environ storage,
+ * atexit/__cxa_atexit machinery, exit/abort, and the __DATA,__mod_init_func
+ * runner. Split out of __libc_start itself (see libc_start.c) so this half
+ * can live in libSystem.dylib while __libc_start -- the one piece that
+ * references the executable's own `main` symbol directly -- stays a
+ * statically-linked-per-executable object; a dylib can never resolve a
+ * reference to whatever `main` some future caller happens to define. */
 #include <unistd.h>
 #include <stdlib.h>
 
@@ -10,8 +14,6 @@ char **environ; /* the one authoritative definition -- see unistd.h */
  * _NSGetExecutablePath, our best-effort stand-in for real dyld image
  * tracking. */
 const char *__libc_argv0;
-
-int main(int argc, char **argv, char **envp);
 
 #define MAX_ATEXIT 32
 static void (*g_atexit_fns[MAX_ATEXIT])(void);
@@ -97,33 +99,10 @@ abort(void)
 void __init_default_rune_locale(void);
 void __init_stack_chk_guard(void);
 
-/* C++ global constructors (registered by the compiler into the
- * __DATA,__mod_init_func section as an array of function pointers) --
- * with no dyld, nothing has ever walked this section, so every global
- * object with a constructor (LLVM's many ManagedStatic/cl::opt
- * registries included) was silently never initialized. ld64
- * synthesizes section$start$/section$end$ symbols for any section, so
- * this needs no runtime Mach-O header parsing. */
-extern void (*__mod_init_func_start[])(void) __asm("section$start$__DATA$__mod_init_func");
-extern void (*__mod_init_func_end[])(void) __asm("section$end$__DATA$__mod_init_func");
-
-static void
-run_mod_init_funcs(void)
-{
-	size_t n = (size_t)(__mod_init_func_end - __mod_init_func_start);
-	for (size_t i = 0; i < n; i++) {
-		__mod_init_func_start[i]();
-	}
-}
-
-void
-__libc_start(int argc, char **argv, char **envp)
-{
-	__init_stack_chk_guard(); /* before anything stack-protector-instrumented runs */
-	environ = envp;
-	__libc_argv0 = argc > 0 ? argv[0] : "";
-	__init_default_rune_locale();
-	run_mod_init_funcs();
-	int rc = main(argc, argv, envp);
-	exit(rc);
-}
+/* run_mod_init_funcs() (C++ global constructor support) lives in
+ * libc_start.c, not here: ld64's section$start$/section$end$ symbols are
+ * scoped to the image being linked, so that function must be compiled
+ * into whichever object is statically linked per-executable (like
+ * __libc_start itself) to see *that executable's* mod-init section --
+ * a copy living in this dylib-bound file would only ever see
+ * libSystem.dylib's own (empty) section instead. */

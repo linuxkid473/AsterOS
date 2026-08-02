@@ -367,17 +367,94 @@ same as real dyld.
   links with `-bind_at_load` (eager binds only) to sidestep it. Fixing this
   needs either a linker that doesn't crash here (maybe the native ld64 once
   Phase 10 lands) or a from-scratch stub-generation workaround.
-- No real libSystem, ever — but the host's ld64 hard-refuses to build *any*
-  dynamic executable/dylib without linking something named libSystem (checked
-  empirically, applies even to an otherwise-empty dylib). Worked around with a
-  hand-authored, link-time-only `libSystem_stub.tbd` (zero real symbols) plus a
-  real empty placeholder Mach-O shipped at `/usr/lib/libSystem.B.dylib` that
-  dyld loads like any other dependency and never actually needs anything from.
+- No real libSystem *at this point in the timeline* — superseded, see Phase 12
+  below. The host's ld64 hard-refuses to build *any* dynamic executable/dylib
+  without linking something named libSystem (checked empirically, applies even
+  to an otherwise-empty dylib); at the time this phase landed that was worked
+  around with a hand-authored, link-time-only `libSystem_stub.tbd` (zero real
+  symbols) plus a real empty placeholder Mach-O shipped at
+  `/usr/lib/libSystem.B.dylib` that dyld loaded like any other dependency and
+  never actually needed anything from.
 - Dylib placement is fixed 256MB slots (`g_next_dylib_base`), not a real VM
   allocator — fine for a handful of dylibs, not a general-purpose scheme.
 - No `@rpath`/`@loader_path`, no two-level-namespace subtlety beyond ordinal
   bind, no weak symbols/re-exports, no `mprotect` re-protection after fixups
   (segments stay RWX — no mprotect syscall wired up yet).
+
+## Phase 12 — libSystem.dylib: DONE, verified live in QEMU
+
+A real `MH_DYLIB` at `/usr/lib/libSystem.B.dylib` (`userland/libSystem/`),
+replacing the empty placeholder Phase 11 shipped there — every `userland/libc/`
+source file compiled `-fPIC` and linked `-dynamiclib`, exporting 568 symbols
+(`nm -gU`). Unlike dyld itself, libSystem is loaded *by* dyld like any other
+dependency and gets properly rebased/bound at load time, so none of dyld's own
+`-fvisibility=hidden`/`DYLD_HIDDEN` self-reference discipline applies here —
+ordinary default-visibility PIC is correct and sufficient.
+
+**The real design problem, and how it was solved:** `__libc_start` (the
+function that calls this process's `main`) can't live inside the dylib —
+`main` only exists once the final executable is linked, so a dylib containing
+a direct call to it fails to link with an undefined `_main` (caught
+empirically, not anticipated). Split `userland/libc/src/start.c`: environ
+storage, `atexit`/`__cxa_atexit`/`__cxa_finalize`, `exit`/`_Exit`/`abort` stay
+in `start.c` (now compiled into the dylib — several other libc/src files
+reference these directly, e.g. `assert.c`'s `abort()`, so they need to live in
+the same image as their callers). `__libc_start` itself, plus
+`run_mod_init_funcs()` (needed alongside it: ld64's `section$start$`/
+`section$end$__DATA$__mod_init_func` symbols are scoped to *whichever image is
+being linked*, so this must stay statically linked per-executable to see that
+executable's own mod-init section, not the dylib's), moved to a new
+`userland/libc/src/libc_start.c` — matches Darwin's real crt1.o/libSystem
+split (crt1.o stays tiny and executable-specific; everything else moves to the
+shared library). `crt0.S` (`_start` itself) and `libc_start.o` are the only
+two objects still statically linked per-executable.
+
+Also removed `dl_stub.c`'s `_dyld_find_unwind_sections()`: zero callers
+anywhere in the tree, and — same class of bug as the mod-init-func issue — it
+referenced `_mh_execute_header`/`section$start$__TEXT$__eh_frame` etc., which
+are only meaningful for the specific calling image, not a shared library's own
+(the comment above it had explicitly documented the "no dyld, exactly one
+statically-linked image" assumption this build finally broke). Genuinely dead
+code once that assumption stopped holding; deleted rather than reworked.
+
+Added `reboot(int howto)` to `syscalls.c` (`SYS_reboot` was already
+`#define`d, just never wrapped) — needed by launchd's shutdown path, Phase 14.
+
+**The self-link quirk:** building libSystem.B.dylib hits the *same* "ld64
+refuses an empty dependency list" check as everything else in this project,
+but can't be satisfied by dyld's existing `libSystem_stub.tbd` (its
+install-name literally *is* `/usr/lib/libSystem.B.dylib` — the dylib being
+built here — which ld64 separately refuses as a self-link). Solved with a
+second stub/placeholder pair, `userland/libSystem/selflink_stub.tbd` +
+a real tiny empty `libSystem_selflink_stub.dylib` shipped alongside the real
+thing. Not a genuine runtime circular dependency despite appearances: our
+dyld's `find_loaded()` registers an image's path in `g_images[]` before
+recursing into its own dependencies (`macho_load.c`), so the nominal
+dep-on-the-dep-on-itself resolves to an already-cached (currently-loading)
+image with no actual recursion.
+
+**Verified live in QEMU**, not assumed: `userland/libSystem/test/systest`, a
+normal dynamically-linked executable (crt0.o + libc_start.o statically linked,
+everything else resolved against the real dylib) — `SYSTEST PASS` after real
+`printf`, `malloc`/`free`, and a `fork()`/`waitpid()` round trip all running
+through actual dyld rebase/bind/export-trie resolution. Re-ran `/bin/dyntest`
+(Phase 11's own regression test) immediately after — still `DYNTEST PASS`,
+confirming the real libSystem now sitting at `/usr/lib/libSystem.B.dylib`
+didn't disturb dyld's existing dependency loading. Also re-ran the full
+Phase 9 static-BusyBox checklist (`mkdir`/`cd`/`echo >`/`cat`/`ls`/`rm`) since
+the `start.c`/`libc_start.c` split touched code shared with the static build
+path — unaffected, `cat` reads back `hello_world` correctly.
+
+Not wired into the top-level `Makefile` — same as dyld itself (also absent
+from the `.PHONY` list), built directly via `bash userland/libSystem/build.sh`
+and `bash userland/libSystem/test/build.sh`. `userland/mkrootfs.sh` picks up
+the real dylib opportunistically if present in `build/`, falling back to the
+Phase 11 placeholder otherwise.
+
+**Known v1 limitations:** BusyBox/coreutils stay static (not migrated to link
+against libSystem — deliberate, see the plan behind this phase; the Phase 9
+verified boot path isn't worth the risk for this pass). `dlopen`/`dlsym`
+(`dl_stub.c`) still honestly return `ENOSYS` — untouched, out of scope here.
 
 ## Known deviations from a literal reading of the task (documented, not oversights)
 - ~~BusyBox → our own tiny multicall static binary~~ — superseded, see Phase 9 above.

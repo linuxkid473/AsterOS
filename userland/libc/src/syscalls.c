@@ -218,6 +218,7 @@ pid_t setsid(void) { return (pid_t)sys_result(raw_syscall0(SYS_setsid)); }
 pid_t getsid(pid_t pid) { return (pid_t)sys_result(raw_syscall1(310 /* SYS_getsid */, pid)); }
 pid_t getpgrp(void) { return (pid_t)raw_syscall0(SYS_getpgrp); }
 int setpgid(pid_t pid, pid_t pgid) { return (int)sys_result(raw_syscall2(SYS_setpgid, pid, pgid)); }
+int reboot(int howto) { return (int)sys_result(raw_syscall1(55 /* SYS_reboot */, howto)); }
 
 /* fork()/vfork(): the raw syscall returns via BOTH %rax (child pid, in
  * both parent and child) AND %rdx (0 in parent, 1 in child) -- ground
