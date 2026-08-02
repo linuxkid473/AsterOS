@@ -1,0 +1,70 @@
+#!/bin/bash
+# Assembles boot/fat16.img, the FAT16 image bsd/miscfs/fat16lite mounts as
+# root. Reformatted from scratch every time rather than mcopy -o'd onto an
+# existing image -- repeated in-place overwrites fragment the FAT cluster
+# chain, which fat16lite's pager_map_to_phys_contiguous can't handle (see
+# TODO.md Phase 9 item 3).
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+ROOTFS_IMG="boot/fat16.img"
+ROOTFS_SIZE_MB=220
+
+CLANG_BIN="build/llvm-static-build/bin/clang"
+LD_BIN="build/ld64_bin/ld64"
+LIBCXX="build/runtimes-install/lib/libc++.a"
+LIBCXXABI="build/runtimes-install/lib/libc++abi.a"
+LIBUNWIND="build/runtimes-install/lib/libunwind.a"
+CLANGRT="build/compiler-rt-install/lib/darwin/libclang_rt.osx.a"
+CLANG_RESOURCE_INCLUDE="build/llvm-static-build/lib/clang/20/include"
+
+rm -f "$ROOTFS_IMG"
+dd if=/dev/zero of="$ROOTFS_IMG" bs=1m count="$ROOTFS_SIZE_MB" status=none
+# Geometry (8 sectors/cluster, 8 reserved sectors, 32-sector root dir) matches
+# the hand-built image fat16lite was originally verified against -- letting
+# mformat pick its own defaults here produced a layout where a file's data
+# start wasn't page-aligned, which pager_map_to_phys_contiguous requires
+# (panics with "computed address ... is not page-aligned" otherwise).
+mformat -i "$ROOTFS_IMG" -R 8 -c 8 -r 32 -h 16 -n 63 -v ROOTFS ::
+
+for d in bin sbin dev etc tmp usr var; do
+	mmd -i "$ROOTFS_IMG" "::/$d"
+done
+
+mcopy -i "$ROOTFS_IMG" src/busybox/busybox_unstripped ::/bin/busybox
+mcopy -i "$ROOTFS_IMG" build/init_launcher/init ::/sbin/init
+
+if [ -x "$CLANG_BIN" ] && [ -x "$LD_BIN" ] && [ -f "$LIBCXX" ] && [ -f "$LIBCXXABI" ] \
+    && [ -f "$LIBUNWIND" ] && [ -f "$CLANGRT" ]; then
+	echo "native toolchain found in build/ -- including it in the rootfs"
+
+	# libc.a is just an archive of the already-built libc objects -- cheap
+	# to (re)create here, not a rebuild of anything.
+	ar rcs build/libc_obj/libc.a build/libc_obj/*.o
+
+	mmd -i "$ROOTFS_IMG" ::/usr/bin
+	mmd -i "$ROOTFS_IMG" ::/usr/lib
+	mmd -i "$ROOTFS_IMG" ::/usr/include
+
+	mcopy -i "$ROOTFS_IMG" "$CLANG_BIN" ::/usr/bin/clang
+	mcopy -i "$ROOTFS_IMG" "$LD_BIN" ::/usr/bin/ld
+	mcopy -i "$ROOTFS_IMG" userland/toolchain/clang.cfg ::/usr/bin/clang.cfg
+	mcopy -i "$ROOTFS_IMG" build/neatvi_obj/neatvi ::/usr/bin/neatvi
+
+	mcopy -i "$ROOTFS_IMG" build/libc_obj/libc.a ::/usr/lib/libc.a
+	mcopy -i "$ROOTFS_IMG" "$LIBCXX" ::/usr/lib/libcxx.a
+	mcopy -i "$ROOTFS_IMG" "$LIBCXXABI" ::/usr/lib/libcxxab.a
+	mcopy -i "$ROOTFS_IMG" "$LIBUNWIND" ::/usr/lib/libunwnd.a
+	mcopy -i "$ROOTFS_IMG" "$CLANGRT" ::/usr/lib/clangrt.a
+
+	mcopy -s -i "$ROOTFS_IMG" userland/libc/include/* ::/usr/include/
+	mmd -i "$ROOTFS_IMG" ::/usr/lib/clang
+	mmd -i "$ROOTFS_IMG" ::/usr/lib/clang/20
+	mcopy -s -i "$ROOTFS_IMG" "$CLANG_RESOURCE_INCLUDE" ::/usr/lib/clang/20/
+else
+	echo "no prebuilt native toolchain in build/ -- deploying core rootfs only"
+	mcopy -i "$ROOTFS_IMG" build/neatvi_obj/neatvi ::/bin/neatvi
+fi
+
+echo "rootfs assembled: $ROOTFS_IMG"
+mdir -i "$ROOTFS_IMG" ::
