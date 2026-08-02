@@ -5,6 +5,7 @@
 #define SYS_sigaction   46
 #define SYS_kill        37
 #define SYS_sigprocmask 48
+#define SYS_sigsuspend  111
 
 /* libc/src/sigtramp.S; only its address is ever taken (never called from
  * C), so the mismatched declared signature vs. real calling convention is
@@ -79,7 +80,21 @@ sigprocmask(int how, const sigset_t *set, sigset_t *oset)
 	return 0;
 }
 
-int sigsuspend(const sigset_t *sigmask) { (void)sigmask; errno = 22; return -1; }
+/* Real syscall (ground-truthed against src/xnu/bsd/kern/syscalls.master
+ * #111: `int sigsuspend(sigset_t mask)`) -- takes the mask by value, not
+ * by pointer, unlike the POSIX wrapper signature. Blocks until a signal
+ * outside `*sigmask` is delivered; the kernel always resumes with EINTR
+ * (sigsuspend never "succeeds" in the normal sense), which time.c's
+ * nanosleep() relies on to know its SIGALRM arrived. */
+int
+sigsuspend(const sigset_t *sigmask)
+{
+	if (!sigmask) {
+		errno = 14; /* EFAULT */
+		return -1;
+	}
+	return (int)sys_result(raw_syscall1(SYS_sigsuspend, (long)*sigmask));
+}
 int sigpending(sigset_t *set) { if (set) { *set = 0; } return 0; }
 
 int

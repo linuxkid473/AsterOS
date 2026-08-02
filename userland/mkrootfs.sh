@@ -31,9 +31,19 @@ for d in bin sbin dev etc tmp usr var; do
 	mmd -i "$ROOTFS_IMG" "::/$d"
 done
 mmd -i "$ROOTFS_IMG" ::/usr/lib
+mmd -i "$ROOTFS_IMG" ::/var/log
 
 mcopy -i "$ROOTFS_IMG" src/busybox/busybox_unstripped ::/bin/busybox
-mcopy -i "$ROOTFS_IMG" build/init_launcher/init ::/sbin/init
+mcopy -i "$ROOTFS_IMG" build/launchd/launchd ::/sbin/launchd
+
+mmd -i "$ROOTFS_IMG" ::/etc/launchd
+mmd -i "$ROOTFS_IMG" ::/etc/launchd/daemons
+mcopy -i "$ROOTFS_IMG" userland/launchd/daemons/com.asteros.shell.plist ::/etc/launchd/daemons/com.asteros.shell.plist
+mcopy -i "$ROOTFS_IMG" userland/launchd/daemons/com.asteros.echotest.plist ::/etc/launchd/daemons/com.asteros.echotest.plist
+if [ -f build/launchd_test/echotest ]; then
+	echo "echotest found in build/ -- including it in the rootfs"
+	mcopy -i "$ROOTFS_IMG" build/launchd_test/echotest ::/bin/echotest
+fi
 
 DYLD_BIN="build/dyld_obj/dyld"
 LIBSYSTEM_REAL="build/libSystem_obj/libSystem.B.dylib"

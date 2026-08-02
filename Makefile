@@ -19,17 +19,17 @@ BOOTX64     := boot/BOOTX64.EFI
 LIBC_STAMP  := build/libc_obj/.stamp
 BUSYBOX_BIN := src/busybox/busybox_unstripped
 NEATVI_BIN  := build/neatvi_obj/neatvi
-INIT_BIN    := build/init_launcher/init
+LAUNCHD_BIN := build/launchd/launchd
 
 TOOLCHAIN_CLANG := build/llvm-static-build/bin/clang
 TOOLCHAIN_LD    := build/ld64_bin/ld64
 
-.PHONY: all kernel bootloader libc busybox neatvi init toolchain image run clean help
+.PHONY: all kernel bootloader libc busybox neatvi launchd toolchain image run clean help
 
 all: image
 
 help:
-	@echo "targets: all, kernel, bootloader, libc, busybox, neatvi, init, toolchain, image, run, clean"
+	@echo "targets: all, kernel, bootloader, libc, busybox, neatvi, launchd, toolchain, image, run, clean"
 
 # --- kernel -----------------------------------------------------------
 # Always delegates to build-kernel.sh, which itself calls into xnu's own
@@ -68,15 +68,21 @@ $(NEATVI_BIN): $(wildcard src/neatvi/*.c src/neatvi/*.h) $(LIBC_STAMP)
 	cd src/neatvi && bash build.sh
 	cd src/neatvi && bash link.sh
 
-# --- init (PID 1) -----------------------------------------------------
-init: $(INIT_BIN)
-$(INIT_BIN): userland/init_launcher.c $(LIBC_STAMP)
-	mkdir -p build/init_launcher
+# --- launchd (PID 1) ---------------------------------------------------
+# Real xnu's load_init_program() tries /sbin/launchd before /sbin/init
+# (ground-truthed in src/xnu/bsd/kern/kern_exec.c), so this ships at
+# /sbin/launchd -- see userland/mkrootfs.sh.
+launchd: $(LAUNCHD_BIN)
+$(LAUNCHD_BIN): userland/launchd/launchd.c userland/launchd/plist.c userland/launchd/plist.h $(LIBC_STAMP)
+	mkdir -p build/launchd
 	$(CLANG) -target x86_64-apple-macos10.15 -ffreestanding -fno-stack-protector -fno-builtin \
 	    -nostdlibinc -isystem userland/libc/include -O1 -g \
-	    -c userland/init_launcher.c -o build/init_launcher/init_launcher.o
+	    -c userland/launchd/launchd.c -o build/launchd/launchd.o
+	$(CLANG) -target x86_64-apple-macos10.15 -ffreestanding -fno-stack-protector -fno-builtin \
+	    -nostdlibinc -isystem userland/libc/include -O1 -g \
+	    -c userland/launchd/plist.c -o build/launchd/plist.o
 	$(CLANG) -target x86_64-apple-macos10.15 -nostdlib -static -e _start \
-	    build/init_launcher/init_launcher.o build/libc_obj/*.o -o $(INIT_BIN)
+	    build/launchd/launchd.o build/launchd/plist.o build/libc_obj/*.o -o $(LAUNCHD_BIN)
 
 # --- native toolchain (never built here -- see docs/architecture.md) ------
 # LLVM/clang/ld64 are cross-built by hand over many hours (Phase 10 in
@@ -93,7 +99,7 @@ toolchain:
 # --- disk images ------------------------------------------------------
 image: $(ESP_IMG)
 
-$(ROOTFS_IMG): busybox $(NEATVI_BIN) $(INIT_BIN)
+$(ROOTFS_IMG): busybox $(NEATVI_BIN) $(LAUNCHD_BIN)
 	bash userland/mkrootfs.sh
 
 $(ESP_IMG): $(BOOTX64) kernel $(ROOTFS_IMG)
@@ -120,7 +126,7 @@ run: image
 # Makefile doesn't own and never rebuilds on its own.
 clean:
 	rm -f $(KERNEL_BIN) $(BOOTX64) boot/boot.o boot/transition.o
-	rm -rf build/libc_obj build/neatvi_obj build/init_launcher
+	rm -rf build/libc_obj build/neatvi_obj build/launchd
 	-$(MAKE) -C src/busybox clean
 	rm -f $(BUSYBOX_BIN)
 	rm -f $(ROOTFS_IMG) $(ESP_IMG)

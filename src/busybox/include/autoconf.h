@@ -2,7 +2,7 @@
  * Automatically generated C config: don't edit
  * Busybox version: 1.36.1
  */
-#define AUTOCONF_TIMESTAMP "2026-08-01 17:11:15 AEST"
+#define AUTOCONF_TIMESTAMP "2026-08-02 11:28:48 AEST"
 
 #define CONFIG_HAVE_DOT_CONFIG 1
 #define ENABLE_HAVE_DOT_CONFIG 1
@@ -4072,10 +4072,14 @@
 #define ENABLE_IOSTAT 0
 #define IF_IOSTAT(...)
 #define IF_NOT_IOSTAT(...) __VA_ARGS__
-#undef CONFIG_KILL
-#define ENABLE_KILL 0
-#define IF_KILL(...)
-#define IF_NOT_KILL(...) __VA_ARGS__
+#define CONFIG_KILL 1
+#define ENABLE_KILL 1
+#ifdef MAKE_SUID
+# define IF_KILL(...) __VA_ARGS__ "CONFIG_KILL"
+#else
+# define IF_KILL(...) __VA_ARGS__
+#endif
+#define IF_NOT_KILL(...)
 #undef CONFIG_KILLALL
 #define ENABLE_KILLALL 0
 #define IF_KILLALL(...)

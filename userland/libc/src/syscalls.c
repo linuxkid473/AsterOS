@@ -423,8 +423,17 @@ munmap(void *addr, size_t len)
 	return (int)sys_result(raw_syscall2(SYS_munmap, (long)addr, (long)len));
 }
 
-unsigned int sleep(unsigned int seconds) { (void)seconds; return 0; /* TODO: nanosleep, see libc TODO log */ }
-int usleep(unsigned int usecs) { (void)usecs; return 0; }
+int
+setitimer(int which, const struct itimerval *value, struct itimerval *ovalue)
+{
+	return (int)sys_result(raw_syscall3(83 /* SYS_setitimer */, which, (long)value, (long)ovalue));
+}
+
+int
+getitimer(int which, struct itimerval *value)
+{
+	return (int)sys_result(raw_syscall2(86 /* SYS_getitimer */, which, (long)value));
+}
 
 unsigned int
 alarm(unsigned int seconds)
@@ -432,11 +441,22 @@ alarm(unsigned int seconds)
 	struct itimerval it, old;
 	memset(&it, 0, sizeof(it));
 	it.it_value.tv_sec = seconds;
-	if (sys_result(raw_syscall3(83 /* SYS_setitimer */, ITIMER_REAL, (long)&it, (long)&old)) < 0) {
+	if (setitimer(ITIMER_REAL, &it, &old) < 0) {
 		return 0;
 	}
 	return (unsigned int)old.it_value.tv_sec;
 }
+
+/* nanosleep()/usleep() (both in time.c, alongside each other, not here)
+ * are the real sleep primitives now -- kept out of this file on purpose:
+ * they need sigaction()/sigsuspend() (signal.c) and a real trampoline
+ * (sigtramp.S), and this file's own PIC copy is what dyld links in its
+ * minimal libc subset (see userland/dyld/build.sh) -- dyld never sleeps,
+ * so it has no reason to pull in signal-handling machinery transitively.
+ * sleep() itself stays a stub here: it needs whole-second nanosleep
+ * semantics with a remaining-time return value, and nothing in this
+ * project currently calls it -- revisit if something ever does. */
+unsigned int sleep(unsigned int seconds) { (void)seconds; return 0; /* TODO: see comment above */ }
 
 long
 sysconf(int name)

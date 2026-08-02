@@ -938,7 +938,7 @@ static const char bbconfig_config[] ALIGN1 =
 "# CONFIG_FREE is not set\n"
 "# CONFIG_FUSER is not set\n"
 "# CONFIG_IOSTAT is not set\n"
-"# CONFIG_KILL is not set\n"
+"CONFIG_KILL=y\n"
 "# CONFIG_KILLALL is not set\n"
 "# CONFIG_KILLALL5 is not set\n"
 "# CONFIG_LSOF is not set\n"

@@ -572,6 +572,129 @@ on top of.
   dynamic growth — correct and simple for this project's current scale,
   documented as a real ceiling rather than silently wrapping.
 
+## Phase 14 — launchd: DONE, verified live in QEMU
+
+Real PID 1 (`userland/launchd/`), replacing `userland/init_launcher.c` (deleted
+entirely — its bootstrap logic, mounting `devfs` and claiming fd 0/1/2 on
+`/dev/console`, is absorbed directly into launchd's own startup). Ships at
+`/sbin/launchd`, not `/sbin/init`: real xnu's `load_init_program()`
+(`src/xnu/bsd/kern/kern_exec.c`) already tries `/sbin/launchd` before
+`/sbin/init` — ground-truthed by reading it, not assumed, and confirmed live
+(`load_init_program: attempting to load /sbin/launchd` succeeds immediately,
+no fallback needed) — so this phase needed zero kernel changes to be picked
+up as PID 1.
+
+**Minimal real XML plist parser** (`userland/launchd/plist.c`): locates the
+root `<dict>` via `strstr` rather than validating the `<?xml ...?>` prolog or
+`<!DOCTYPE>` line (there's exactly one producer of these files, this project
+itself, so no entity/CDATA/DTD generality is needed), then a hand-written
+recursive-descent walk over `<key>`/`<string>`/`<array>`/`<true/>`/`<false/>`/
+`<integer>`/`<dict>`. Supports `Label`, `ProgramArguments`, `RunAtLoad`,
+`KeepAlive` (simple bool form only), `EnvironmentVariables`, `StandardOutPath`/
+`StandardErrorPath`. Unsupported keys (`Sockets`, `WatchPaths`,
+`StartInterval`, dict-form `KeepAlive`, `UserName`) are walked and discarded
+by a generic `skip_value()` rather than aborting the parse — genuinely
+ignored, not silently half-applied.
+
+**Supervision**: loads every `/etc/launchd/daemons/*.plist`, sorted by
+filename (this project's v1 stand-in for real dependency ordering — no
+`Requires`-style key support yet), forks+execs every `RunAtLoad` daemon, then
+blocks in `wait4(-1, ...)` reaping *any* exited process (a real PID 1
+responsibility — orphans reparented to init must be reaped too, not just
+tracked daemons) and re-forking any `KeepAlive` daemon that exits.
+`SIGTERM` (`kill -TERM 1`) begins a bounded shutdown: signal every
+supervised child, drain exits via `alarm(5)`+`sigsuspend` bounding the wait
+(no SIGKILL escalation after the alarm fires — real launchd's crash/shutdown
+backoff is more elaborate, documented v1 gap), then `reboot(RB_HALT)`
+(wired up in Phase 12) — falls back to spinning forever if `reboot()`
+somehow fails, same defensive pattern `init_launcher.c` used. Structured
+logging (`llog`/`llog_console` in `launchd.c`) writes every event to
+`/var/log/launchd.log`; only launchd's own top-level lifecycle events
+(boot, daemon-load, shutdown) also echo to the console — routine per-daemon
+spawn/exit events are file-only, see the bugs below for why.
+
+**Two libc additions this phase actually needed, not scope creep**:
+`sigsuspend(2)` (`signal.c`) went from an unconditional `errno=EINVAL` stub
+to the real syscall (#111, ground-truthed against `syscalls.master`: takes
+`sigset_t` by value, not by pointer, unlike the POSIX wrapper). `nanosleep()`
+(`time.c`) went from a no-op stub to a real implementation via
+`setitimer(ITIMER_REAL, ...)` + `sigsuspend()` — this kernel has no dedicated
+timed-wait syscall (no BSD `nanosleep(2)`, no `select`/`poll` with a
+timeout), so this is the composite-but-real substitute; `usleep()` now calls
+through it. `sleep()` stays a stub (nothing calls it yet).
+
+**Four real bugs found and fixed during QEMU verification, in the order hit:**
+1. **Runaway respawn storm.** The first version of `echotest.c` (the
+   KeepAlive regression daemon, `userland/launchd/test/`) exits in well
+   under a millisecond; without any throttle, launchd re-forked it
+   thousands of times a minute, flooding the console and burning CPU —
+   fixed with a per-daemon minimum respawn interval
+   (`RESPAWN_THROTTLE_MS`, `spawn_daemon()`), verified to land close to the
+   intended 500ms by reading actual timestamps back out of
+   `/var/log/launchd.log` (565ms observed, not host-clock guesses — see
+   the file's own commit history for a wrong turn where a naive host-side
+   timing estimate briefly looked like the throttle wasn't working at all).
+2. **Console flooding even after throttling.** Even at ~2 respawns/sec,
+   echoing every routine daemon start/exit to the shared physical console
+   (fd 1) made the interactive shell unusable, since it lives on the same
+   console. Fixed by splitting logging into file-only (`llog`, routine
+   per-daemon events) vs file+console (`llog_console`, launchd's own
+   one-time lifecycle events) — ground-truthed live, not a hypothetical.
+3. **`/var/log` didn't exist.** `userland/mkrootfs.sh` created `/var` but
+   never `/var/log`, so `open(..., O_CREAT, ...)` on both
+   `/var/log/launchd.log` and `/var/log/echotest.log` was silently
+   returning `ENOENT` the entire time — the daemons were provably running
+   correctly (visible via console echo and rising PIDs) while every log
+   write silently no-op'd. Fixed by adding `mmd ::/var/log` to
+   `mkrootfs.sh`, plus a startup check in `bootstrap_console()` that now
+   writes a loud one-line warning to the console if the log file can't be
+   opened, so this class of bug can't go unnoticed silently again.
+4. **`nanosleep()` panicked the kernel on shutdown (the serious one).**
+   `kill -TERM 1` during a respawn-throttle sleep interrupted the
+   in-flight `sigsuspend()` with `SIGTERM` instead of the `SIGALRM` it was
+   waiting for. The old code restored `SIGALRM`'s previous disposition
+   (`SIG_DFL` — terminate) without disarming the still-armed `setitimer`
+   timer; when that orphaned timer fired moments later, it killed launchd
+   itself via default `SIGALRM` handling. Xnu treats PID 1 exiting as
+   always fatal (`initproc exited -- exit reason namespace 2 subcode 0xe`,
+   subcode 14 = `SIGALRM`), so this was a full kernel panic, caught live,
+   not in review. Fixed by unconditionally disarming the timer
+   (`setitimer` with a zeroed `itimerval`) before restoring the old
+   handler, regardless of *why* `sigsuspend()` returned.
+
+Also enabled BusyBox's `kill` applet (`CONFIG_KILL=y` in
+`src/busybox/.config`, previously unset) — needed to actually exercise
+`kill -TERM 1` from the interactive shell for verification; real,
+standard POSIX utility, not scope creep specific to this project.
+
+**Verified live in QEMU, in one boot**: clean boot log through
+`[launchd] ... starting`/`loaded ...` for both daemons; `dyntest`/
+`systest`/`objctest` (Phases 11-13's own regression tests) all still
+`PASS`; the full Phase 9 BusyBox checklist (`mkdir`/`cd`/`echo >`/`cat`/
+`ls`/`rm`) unregressed; `echotest`'s `KeepAlive` respawn confirmed via
+growing timestamps in `/var/log/launchd.log` (not just rising PIDs);
+`kill -TERM 1` producing `shutdown requested, signaling 2 running
+daemon(s)` → `halting` → the kernel's own real halt sequence (`syncing
+disks... Killing all processes`, `done`, `CPU halted`) with **no panic**.
+
+**Known v1 limitations (documented, not oversights):**
+- No dependency ordering beyond filename sort — no `Requires`/`Wants`-style
+  keys.
+- `KeepAlive` supports only the simple boolean form, not the dict form
+  (`SuccessfulExit`, `NetworkState`, ...).
+- No `Sockets`/`WatchPaths`/`StartInterval`/`UserName` — parsed-and-skipped,
+  not honored.
+- Respawn throttling is a fixed single interval, not real launchd's
+  exponential crash-loop backoff.
+- Shutdown has no SIGKILL escalation after the drain alarm fires — whatever
+  hasn't exited by then is left for the kernel to tear down at reboot.
+- `nanosleep()`'s `setitimer`+`sigsuspend` implementation temporarily
+  reprograms `ITIMER_REAL` and `SIGALRM`'s handler; a caller with its own
+  `alarm()`/`SIGALRM` in flight at the same time would race against it —
+  fine for every caller in this project today (do_shutdown's own `alarm(5)`
+  never overlaps with an in-progress `nanosleep()` call), but a real
+  kernel-level timed wait wouldn't have this restriction.
+
 ## Known deviations from a literal reading of the task (documented, not oversights)
 - ~~BusyBox → our own tiny multicall static binary~~ — superseded, see Phase 9 above.
 - ~~Root filesystem → MOCKFS + RAMDisk~~ — superseded: the actual root filesystem is

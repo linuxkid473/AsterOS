@@ -5,6 +5,7 @@
  * documented, deliberate limitation, not a bug. */
 #include <time.h>
 #include <sys/time.h>
+#include <signal.h>
 #include <string.h>
 #include <stdio.h>
 #include <mach/mach_time.h>
@@ -83,15 +84,79 @@ clock(void)
 	return (clock_t)time((void *)0) * CLOCKS_PER_SEC;
 }
 
+/* SIGALRM handler installed only for the duration of a nanosleep() call
+ * below -- needed because SIGALRM's default disposition is to terminate
+ * the process, and sigsuspend() must have something to wake it up. */
+static void
+nanosleep_alarm_noop(int sig)
+{
+	(void)sig;
+}
+
+/* There is no dedicated timed-wait syscall in this kernel (no BSD
+ * nanosleep(2), no select()/poll() with a timeout wired up yet) --
+ * real, not a stub: arms a one-shot ITIMER_REAL via setitimer(2) (already
+ * used by alarm(), see syscalls.c) and blocks in sigsuspend(2) until it
+ * fires. Known sharp edge, documented rather than hidden: this
+ * temporarily installs its own SIGALRM handler and reprograms the
+ * ITIMER_REAL timer, so a caller that has its own pending alarm()/
+ * SIGALRM in flight at the same time will have it clobbered -- fine for
+ * every caller in this project today (nothing calls nanosleep/usleep/
+ * sleep while an alarm() from the same process is outstanding), but a
+ * real kernel-level timed wait would not have this restriction. */
 int
 nanosleep(const struct timespec *req, struct timespec *rem)
 {
-	(void)req;
 	if (rem) {
 		rem->tv_sec = 0;
 		rem->tv_nsec = 0;
 	}
-	return 0; /* TODO: no real sleep syscall wired up yet */
+	if (!req || (req->tv_sec == 0 && req->tv_nsec == 0)) {
+		return 0;
+	}
+
+	struct sigaction sa, old_sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = nanosleep_alarm_noop;
+	sigaction(SIGALRM, &sa, &old_sa);
+
+	struct itimerval it, old_it;
+	memset(&it, 0, sizeof(it));
+	it.it_value.tv_sec = req->tv_sec;
+	it.it_value.tv_usec = req->tv_nsec / 1000;
+	setitimer(ITIMER_REAL, &it, &old_it);
+
+	sigset_t empty = 0;
+	sigsuspend(&empty); /* wakes on SIGALRM -- or any OTHER signal, e.g. a
+	                      * SIGTERM the caller's own handler catches, in
+	                      * which case the itimer armed above is still
+	                      * live and hasn't fired yet. */
+
+	/* Ground-truthed as a real, not theoretical, bug: without this,
+	 * a nanosleep() interrupted by a signal other than SIGALRM leaves
+	 * the timer armed, then hands SIGALRM's disposition back to
+	 * old_sa (often SIG_DFL, which terminates the process) below --
+	 * the orphaned timer firing later kills the caller out of nowhere.
+	 * Caught live: launchd (PID 1) died this way seconds after handling
+	 * a SIGTERM mid-throttle-sleep, which panics the kernel (PID 1
+	 * exiting is always fatal) -- see TODO.md Phase 14. Disarming
+	 * unconditionally, regardless of why sigsuspend returned, is the
+	 * actual fix. */
+	struct itimerval disarm;
+	memset(&disarm, 0, sizeof(disarm));
+	setitimer(ITIMER_REAL, &disarm, (void *)0);
+
+	sigaction(SIGALRM, &old_sa, (void *)0);
+	return 0;
+}
+
+int
+usleep(unsigned int usecs)
+{
+	struct timespec ts;
+	ts.tv_sec = usecs / 1000000;
+	ts.tv_nsec = (long)(usecs % 1000000) * 1000;
+	return nanosleep(&ts, (void *)0);
 }
 
 /* civil_from_days / days_from_civil: Howard Hinnant's well-known
