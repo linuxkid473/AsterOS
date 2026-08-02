@@ -456,6 +456,122 @@ against libSystem — deliberate, see the plan behind this phase; the Phase 9
 verified boot path isn't worth the risk for this pass). `dlopen`/`dlsym`
 (`dl_stub.c`) still honestly return `ENOSYS` — untouched, out of scope here.
 
+## Phase 13 — libobjc.A.dylib: DONE, verified live in QEMU
+
+A real Objective-C runtime (`userland/libobjc/`), `/usr/lib/libobjc.A.dylib`,
+depending on Phase 12's libSystem. Targets the genuine nonfragile-ABI2
+on-disk metadata layout (`class_t`/`class_ro_t`/`method_t`/`ivar_t`/
+`category_t`/`protocol_t`/`property_t`) as the host's own clang emits it for
+`-target x86_64-apple-macos10.15 -fobjc-runtime=macosx` — every struct in
+`objc_abi.h` was ground-truthed field-by-field against `otool`/`objdump`
+output on a real compiled probe `.o`, not written from memory. The
+regression test (`userland/libobjc/test/test.m`) is unmodified real `.m`
+source built with the host's off-the-shelf clang, exactly like a real
+Darwin `.m` file would be.
+
+**dyld got two small, additive extensions**, neither touching rebase/bind/
+export logic: `image_run_mod_init_funcs()` (`macho_load.c`/`image.h`) walks
+any loaded image's `LC_SEGMENT_64` sections at runtime for
+`S_MOD_INIT_FUNC_POINTERS` and runs them — previously only the main
+executable's own compile-time mod-init section ever ran, dylibs loaded at
+runtime never had theirs run at all. And a hardcoded post-bind, pre-init
+hook in `dyld_main.c`: if `/usr/lib/libobjc.A.dylib` is among the loaded
+images, resolve its exported `__objc_init` via the existing
+`image_resolve_export` and call it with every loaded image's mach header,
+before any mod-init-funcs run anywhere — this project's intentionally
+simplified stand-in for real dyld's generic `_dyld_objc_notify_register`
+callback-registration API (one hardcoded client instead of a registration
+mechanism, since libobjc is the only client that needs it). Mod-init-funcs
+run in reverse image-registration order so dependencies always initialize
+before dependents.
+
+**Internal (non-ABI-visible) design**: class realization uses a tagged
+pointer in `class_t.data` (`class_rw_t*` OR 1) to distinguish "still points
+at the compiler's read-only `class_ro_t`" from "already realized" — the
+low bit is otherwise always 0 on a real pointer since the struct requires
+alignment, and nothing outside this runtime ever reads `class_t.data`
+directly. Realization recurses into the superclass first (required for
+correct ivar-offset patching, see below) and is genuinely two-pass at the
+image level: pass 1 registers every class in every loaded image, pass 2
+(`objc_attach_categories`) attaches every pending category's methods/
+protocols/properties — allows a category compiled into one image to
+extend a class defined in another, matching real dyld/objc ordering.
+Method dispatch (`msgSend.S`, hand-written x86_64) saves all six integer
+and eight `xmm` argument registers to a scratch stack area, resolves the
+IMP via a small per-class open-addressing cache (`dispatch.c`, our own
+bucket format — internal, not ABI-visible) or a full superclass-chain
+walk on a miss, then restores registers and tail-jumps into the IMP so
+the callee's own `ret` returns directly to the original caller.
+`objc_msgSendSuper2` was ground-truthed to dereference
+`current_class->superclass` (not just `current_class`) — the actual
+difference from the legacy, no-longer-emitted `objc_msgSendSuper`.
+
+**Three real bugs found and fixed during QEMU verification:**
+- **Class realization was completely broken** until the tagged-pointer fix
+  above landed: `class_rw()` originally read `class_t.data` unconditionally,
+  but `data` is never NULL (it's `class_ro_t*` before realization,
+  `class_rw_t*` after), so the "already realized" guard was true on every
+  class's very first call — `objc_getClass` returned NULL for every class
+  despite the raw compiled metadata being perfectly valid. Classrefs still
+  resolved fine via ordinary dyld rebase/bind (unrelated mechanism), which
+  is why method dispatch partially appeared to work even with zero classes
+  actually registered — a misleading symptom that cost real debugging time.
+- **Ivar offset patching is not optional.** Real nonfragile ABI2 requires
+  the runtime to patch each ivar's `*offset` at realization time using the
+  superclass's actual instance size, since the compiler can't know a
+  cross-image superclass's real size at compile time. Missing this crashed
+  on the first property access through an inherited ivar.
+- **ARC's `objc_retainAutoreleasedReturnValue` fast path turned out to be
+  semantically required, not a performance optimization** — ground-truthed
+  the hard way with a double-free/under-release bug (full account in
+  `arc.c`'s and `autorelease.c`'s comments). An autoreleased value
+  immediately "claimed" by the caller needs its pending pool release
+  canceled (`objc_autorelease_try_reclaim_last`, approximated here as
+  "is the top of the single global autorelease stack literally this
+  object," correct for the call-adjacent pattern real `-fobjc-arc`
+  codegen actually produces) **while still** recording a real extra unit
+  of ownership in the side-table refcount — skipping either half
+  double-frees or under-retains. Separately: calling `objc_autorelease`
+  directly from ARC-compiled code, even from within the same translation
+  unit, gets extra retain/release bracketing inserted by the compiler
+  around the call regardless of whether the result is used — the test's
+  actual `-autorelease` send had to move into its own non-ARC translation
+  unit (`test/mrc_helper.m`) to get deterministic, correct behavior.
+
+**Verified live in QEMU**: `build/libobjc_obj/objctest`, real `.m` source
+(subclass with an ivar + synthesized property, a category adding protocol
+conformance, `[super init]`, ARC-managed alloc/scope-exit release, and an
+explicit `@autoreleasepool` block) — `OBJCTEST PASS`. Immediately re-ran
+`/bin/dyntest` (Phase 11) and `/bin/systest` (Phase 12) — still
+`DYNTEST PASS`/`SYSTEST PASS` — plus the full Phase 9 static-BusyBox
+checklist, confirming no regression anywhere in the chain this phase built
+on top of.
+
+**Known v1 limitations (documented, not oversights):**
+- Refcounts are a global linear side table (object ptr → extra count), not
+  Apple's isa-embedded inline refcount — an internal, ABI-invisible
+  optimization that no compiled `.m` code or external caller can observe,
+  so it was deprioritized. Same story for weak references (side table,
+  owner → slot list) instead of a real weak table with zeroing tied into
+  deallocation ordering guarantees beyond "on `dealloc`, walk and null."
+- A single global autorelease pool stack, not per-thread — this project
+  has no real threads yet (`pthread_stub.c` unconditionally fails
+  `pthread_create`), so a thread-local stack would be dead complexity
+  with nothing to exercise it.
+- The `_objc_init` dyld hook is one hardcoded path match on
+  `/usr/lib/libobjc.A.dylib`, not a generic callback-registration API —
+  fine with exactly one client, would need real work to support more.
+- No `@synchronized`, no exceptions (`@try`/`@catch`/`@throw`), no
+  associated objects, no `NSObject` beyond what `Root.m` implements by
+  hand (alloc/init/dealloc/retain/release/autorelease/class/
+  isKindOfClass:/respondsToSelector:/isEqual:/hash/description/
+  conformsToProtocol:) — enough for the test surface, not a full
+  Foundation-scale root class.
+- Fixed-size static tables throughout (`OBJC_MAX_SELECTORS`,
+  `OBJC_MAX_CLASSES`, `MAX_REFCOUNTED`, `MAX_AUTORELEASED`, ...), not
+  dynamic growth — correct and simple for this project's current scale,
+  documented as a real ceiling rather than silently wrapping.
+
 ## Known deviations from a literal reading of the task (documented, not oversights)
 - ~~BusyBox → our own tiny multicall static binary~~ — superseded, see Phase 9 above.
 - ~~Root filesystem → MOCKFS + RAMDisk~~ — superseded: the actual root filesystem is

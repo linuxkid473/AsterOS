@@ -27,7 +27,43 @@ Used for the native-Clang bring-up (see TODO.md Phase 10) — an independent, mu
 Building real dyld + Libsystem + objc4 + full Libc is a multi-month undertaking on its own (ravynOS spent ~6 months and still lacked working input). XNU's exec path only invokes dyld when a Mach-O has `LC_LOAD_DYLINKER`. A statically-linked Mach-O with no dylib load commands is exec'd directly by the kernel with no userspace runtime dependency at all.
 **Decision:** write our own tiny raw-syscall "libc" (BSD syscall ABI: syscall class 2 → `(0x2000000 | number)` in `%rax`, args in `%rdi,%rsi,%rdx,%r10,%r8,%r9`, `syscall` instruction, carry flag set on error) and build our coreutils/shell as static Mach-O against it. This *is* the "tiny userspace" / BusyBox-equivalent phase — documented here as a deliberate deviation from literally porting upstream BusyBox (which targets a real libc/dyld environment we're not building).
 
-**Superseded**: a real, from-scratch dyld (`userland/dyld/`) now exists and is verified live in QEMU — see `TODO.md` Phase 11 for what it does, the ASLR-slide/position-independence gotcha that cost the most time, and its known v1 limitations (no lazy binding exercised yet, no real libSystem, fixed-slot dylib placement). A real libSystem.dylib also now exists (`userland/libSystem/`, wrapping `userland/libc/`) — see `TODO.md` Phase 12; still no objc4/launchd yet at this point in the timeline (see Phase 13/14). Static, dyld-free linking remains the default for anything that doesn't need a shared dependency — BusyBox/coreutils were deliberately *not* migrated to dynamic linking when libSystem landed, to avoid touching the already-verified Phase 9 boot path.
+**Superseded**: a real, from-scratch dyld (`userland/dyld/`) now exists and is verified live in QEMU — see `TODO.md` Phase 11 for what it does, the ASLR-slide/position-independence gotcha that cost the most time, and its known v1 limitations (no lazy binding exercised yet, no real libSystem, fixed-slot dylib placement). A real libSystem.dylib also now exists (`userland/libSystem/`, wrapping `userland/libc/`) — see `TODO.md` Phase 12. A real libobjc (`userland/libobjc/`, genuine nonfragile-ABI2 metadata layout, real `.m` files compile and run unmodified) also now exists — see `TODO.md` Phase 13 and the libobjc decision section below; still no launchd yet at this point in the timeline (see Phase 14). Static, dyld-free linking remains the default for anything that doesn't need a shared dependency — BusyBox/coreutils were deliberately *not* migrated to dynamic linking when libSystem landed, to avoid touching the already-verified Phase 9 boot path.
+
+## Decision: libobjc ABI-compatibility scope (see TODO.md Phase 13)
+The on-disk metadata clang emits for an `.m` file — `class_t`/`class_ro_t`/
+`method_t`/`ivar_t`/`category_t`/`protocol_t`/`property_t`, the
+`__objc_classlist`/`__objc_catlist`/`__objc_protolist`/`__objc_selrefs`
+sections — is real Apple nonfragile-ABI2 layout, ground-truthed field-by-
+field against `otool`/`objdump` output on a real compiled probe object, not
+approximated. This is the part real `.m` source (compiled unmodified with
+the host's own clang) actually depends on, so it's the part that has to be
+exactly right.
+
+Everything the runtime keeps for its *own* bookkeeping — nothing external
+ever reads these — is not ABI-constrained and was kept deliberately simple:
+- **Refcounts**: a global linear side table (object → extra retain count),
+  not Apple's isa-embedded inline refcount. Purely an internal performance
+  characteristic; no compiled `.m` code can observe which one is in use.
+- **Weak references**: a side table (owner → list of weak slot pointers),
+  zeroed on `dealloc`, instead of a real weak table with the finer
+  ordering guarantees Apple's version provides under real concurrency.
+- **Autorelease pools**: one global stack, not per-thread — this project
+  has no real threads yet (`pthread_create` is a stub that always fails),
+  so per-thread pools would be untestable dead complexity.
+- **Method cache**: a small fixed-size per-class open-addressing bucket
+  table, not Apple's real `cache_t` bit-packed layout.
+- **dyld → libobjc handoff**: a single hardcoded path check
+  (`/usr/lib/libobjc.A.dylib`) that dyld resolves and calls `_objc_init`
+  on directly, rather than a generic `_dyld_objc_notify_register`-style
+  callback-registration API. Correct with exactly one client; would need
+  real work to generalize to more.
+
+One real semantic requirement, not a simplification: ARC's
+`objc_retainAutoreleasedReturnValue` fast-path reclaim
+(`objc_autorelease_try_reclaim_last` in `autorelease.c`) turned out to be
+necessary for correctness, not an optional performance trick — ground-
+truthed with a double-free bug during Phase 13 verification. Full account
+in `TODO.md` Phase 13 and the comments in `arc.c`/`autorelease.c`.
 
 ## Decision: root filesystem = MOCKFS + in-memory RAMDisk (no disk driver at all)
 Investigated three options:

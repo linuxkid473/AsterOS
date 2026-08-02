@@ -138,6 +138,39 @@ image_parse_loaded(struct image *im, const struct mach_header_64 *mh, uint64_t s
 	}
 }
 
+/* Runs one image's __DATA,__mod_init_func section (C++ global constructors,
+ * and -- as of Phase 13 -- also how libobjc's own init gets a look at
+ * every image, though its class registration itself happens earlier, via
+ * the hardcoded _objc_init hook in dyld_main.c). Unlike a statically
+ * linked executable's own copy of this logic (userland/libc/src/
+ * libc_start.c, which gets it for free via ld64's per-image
+ * section$start$/section$end$ symbols), dyld has to actually find the
+ * section by walking load commands at runtime -- it's handling images it
+ * never linked against. */
+void
+image_run_mod_init_funcs(struct image *im)
+{
+	const uint8_t *cmd = (const uint8_t *)im->mh + sizeof(struct mach_header_64);
+	for (uint32_t i = 0; i < im->mh->ncmds; i++) {
+		const struct load_command *lc = (const struct load_command *)cmd;
+		if (lc->cmd == LC_SEGMENT_64) {
+			const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+			const struct section_64 *secs = (const struct section_64 *)(sc + 1);
+			for (uint32_t j = 0; j < sc->nsects; j++) {
+				if ((secs[j].flags & SECTION_TYPE) != S_MOD_INIT_FUNC_POINTERS) {
+					continue;
+				}
+				void (**funcs)(void) = (void (**)(void))image_addr(im, secs[j].addr);
+				uint32_t n = secs[j].size / sizeof(void *);
+				for (uint32_t k = 0; k < n; k++) {
+					funcs[k]();
+				}
+			}
+		}
+		cmd += lc->cmdsize;
+	}
+}
+
 struct image *
 image_load_dependency(const char *path)
 {

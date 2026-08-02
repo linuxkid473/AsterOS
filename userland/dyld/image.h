@@ -80,5 +80,6 @@ void image_rebase(struct image *im);
 void image_bind(struct image *im);
 uint64_t dyld_bind_lazy_symbol(struct image *im, uint32_t lazy_offset);
 struct image *image_containing_address(uint64_t addr);
+void image_run_mod_init_funcs(struct image *im);
 
 #endif /* DYLD_IMAGE_H */

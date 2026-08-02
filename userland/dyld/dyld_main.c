@@ -94,6 +94,46 @@ dyld_bootstrap_main(const struct mach_header_64 *main_mh, int argc, char **argv,
 		image_bind(&g_images[i]);
 	}
 
+	/* libobjc needs to see every loaded image's Mach-O metadata (class
+	 * lists etc.) before anything's global constructors run -- real dyld
+	 * does this via a generic registration callback
+	 * (_dyld_objc_notify_register) any client can hook; we hardcode the
+	 * one client that exists. Deliberately simpler than the real API,
+	 * documented as such (see TODO.md Phase 13). */
+	for (int i = 0; i < g_nimages; i++) {
+		const char *path = g_images[i].path;
+		size_t len = strlen(path);
+		static const char suffix[] = "/libobjc.A.dylib";
+		if (len >= sizeof(suffix) - 1 &&
+		    strcmp(path + len - (sizeof(suffix) - 1), suffix) == 0) {
+			/* the C function is named _objc_init (matching Apple's real
+			 * symbol) -- the leading-underscore C-symbol convention adds
+			 * one more on top of that, so the Mach-O export is
+			 * __objc_init (confirmed via nm, not guessed). */
+			uint64_t objc_init_addr = image_resolve_export(&g_images[i], "__objc_init");
+			if (objc_init_addr) {
+				const struct mach_header_64 *mhs[IMAGE_MAX];
+				for (int j = 0; j < g_nimages; j++) {
+					mhs[j] = g_images[j].mh;
+				}
+				void (*objc_init)(const struct mach_header_64 *const *, int) =
+				    (void (*)(const struct mach_header_64 *const *, int))(uintptr_t)objc_init_addr;
+				objc_init(mhs, g_nimages);
+			}
+			break;
+		}
+	}
+
+	/* Dependencies before dependents, main executable last: a dylib's own
+	 * sub-dependencies always land at a strictly higher g_images[] index
+	 * than the dylib itself (image_load_dependency appends recursively
+	 * loaded deps after registering the parent's own slot), and the main
+	 * executable is always index 0 -- so a simple reverse walk gives a
+	 * correct-enough ordering without tracking a real dependency graph. */
+	for (int i = g_nimages - 1; i >= 0; i--) {
+		image_run_mod_init_funcs(&g_images[i]);
+	}
+
 	for (int i = 0; i < g_nimages && i < IMAGE_MAX; i++) {
 		g_image_info_array[i].imageLoadAddress = (const struct mach_header *)g_images[i].mh;
 		g_image_info_array[i].imageFilePath = g_images[i].path;

@@ -55,6 +55,11 @@ if [ -f "$DYLD_BIN" ]; then
 		mcopy -i "$ROOTFS_IMG" build/dyld_obj/libtest.dylib ::/usr/lib/libtest.dylib
 		mcopy -i "$ROOTFS_IMG" build/dyld_obj/dyntest ::/bin/dyntest
 	fi
+	if [ -f build/libobjc_obj/libobjc.A.dylib ] && [ -f build/libobjc_obj/objctest ]; then
+		echo "libobjc found in build/ -- including it in the rootfs"
+		mcopy -i "$ROOTFS_IMG" build/libobjc_obj/libobjc.A.dylib ::/usr/lib/libobjc.A.dylib
+		mcopy -i "$ROOTFS_IMG" build/libobjc_obj/objctest ::/bin/objctest
+	fi
 fi
 
 if [ -x "$CLANG_BIN" ] && [ -x "$LD_BIN" ] && [ -f "$LIBCXX" ] && [ -f "$LIBCXXABI" ] \
