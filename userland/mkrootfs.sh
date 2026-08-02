@@ -40,6 +40,9 @@ mmd -i "$ROOTFS_IMG" ::/etc/launchd
 mmd -i "$ROOTFS_IMG" ::/etc/launchd/daemons
 mcopy -i "$ROOTFS_IMG" userland/launchd/daemons/com.asteros.shell.plist ::/etc/launchd/daemons/com.asteros.shell.plist
 mcopy -i "$ROOTFS_IMG" userland/launchd/daemons/com.asteros.echotest.plist ::/etc/launchd/daemons/com.asteros.echotest.plist
+if [ -f build/libSystem_obj/pthreadtest ]; then
+	mcopy -i "$ROOTFS_IMG" userland/launchd/daemons/com.asteros.pthreadtest.plist ::/etc/launchd/daemons/com.asteros.pthreadtest.plist
+fi
 if [ -f build/launchd_test/echotest ]; then
 	echo "echotest found in build/ -- including it in the rootfs"
 	mcopy -i "$ROOTFS_IMG" build/launchd_test/echotest ::/bin/echotest
@@ -57,6 +60,9 @@ if [ -f "$DYLD_BIN" ]; then
 		mcopy -i "$ROOTFS_IMG" build/libSystem_obj/libSystem_selflink_stub.dylib ::/usr/lib/libSystem_selflink_stub.dylib
 		if [ -f build/libSystem_obj/systest ]; then
 			mcopy -i "$ROOTFS_IMG" build/libSystem_obj/systest ::/bin/systest
+		fi
+		if [ -f build/libSystem_obj/pthreadtest ]; then
+			mcopy -i "$ROOTFS_IMG" build/libSystem_obj/pthreadtest ::/bin/pthreadtest
 		fi
 	elif [ -f "$LIBSYSTEM_PLACEHOLDER" ]; then
 		mcopy -i "$ROOTFS_IMG" "$LIBSYSTEM_PLACEHOLDER" ::/usr/lib/libSystem.B.dylib

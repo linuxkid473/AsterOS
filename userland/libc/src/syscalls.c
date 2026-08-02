@@ -19,7 +19,8 @@
 #include <string.h>
 #include <stdlib.h>
 
-int errno;
+/* errno's actual storage now lives in pthread.c (__errno_location(),
+ * genuinely per-thread since real pthreads exist -- see errno.h). */
 
 /* ---- our own cwd cache: xnu-6153 has no getcwd(2); Darwin's real Libc
  * implements getcwd() as a userland directory-walk using .. + stat, which

@@ -14,7 +14,6 @@
 #include <errno.h>
 #include <runetype.h>
 
-extern int errno;
 
 /* Populated by __init_default_rune_locale() (called from __libc_start
  * before main(), see start.c) rather than a static initializer list --

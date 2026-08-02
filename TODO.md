@@ -695,6 +695,175 @@ disks... Killing all processes`, `done`, `CPU halted`) with **no panic**.
   never overlaps with an in-progress `nanosleep()` call), but a real
   kernel-level timed wait wouldn't have this restriction.
 
+## Phase 16 — Real pthreads: DONE, verified live in QEMU
+
+Genuine kernel-scheduled threads, not the old `userland/libc/src/pthread_stub.c`
+(a from-scratch single-threaded shim where `pthread_create()` honestly returned
+`EAGAIN` — see its own header comment, since deleted). Two halves: the kernel
+side (`bsdthread_create`/`bsdthread_register`/`bsdthread_terminate`/`psynch_*`
+actually working) and a real userland `userland/libc/src/pthread.c` built on
+top of them.
+
+**The kernel-side surprise**: xnu-6153 doesn't implement `bsdthread_create`/
+`psynch_*` itself at all. `bsd/pthread/pthread_shims.c` and
+`bsd/pthread/pthread_workqueue.c` are real, unmodified xnu source and *are*
+fully present — but they're only the kernel-core half of a split design:
+every syscall trampoline (`bsdthread_create()` in `pthread_shims.c`, for
+example) just dispatches through a `pthread_functions` table that a separate
+`pthread.kext` is supposed to fill in at load time via `pthread_kext_register()`.
+With no kext loader in this project, that table was permanently `NULL`
+(`pthread_shims.c`'s `pthread_init()` had already been patched, pre-Phase-16,
+to no-op instead of panic on that — see the file's own history). Real
+pthreads needed that kext's *content*, not just a workaround for its absence.
+
+**Fix, matching this project's established "fold what would be a kext
+directly into the kernel image" pattern** (same idea as `fat16lite`): vendored
+the real, matching-era Apple `libpthread` kernel component
+(`apple-oss-distributions/libpthread` @ `2b59ad9dc8e0840629200acd34a2251a9abcf900`,
+tag `rel/libpthread-416` — the exact commit `distribution-macOS` pins at
+`macos-10156`, the closest tagged release to this project's `xnu-6153.141.1`/
+10.15.7) into `src/libpthread`, then copied its three kernel-side files
+(`kern/kern_init.c`, `kern/kern_support.c`, `kern/kern_synch.c`, plus the
+headers they need) into `src/xnu/bsd/pthread/libpthread_kern/`
+(`bsd/conf/files`, `makedefs/MakeInc.def`'s new `INCFLAGS_ASTEROS_LIBPTHREAD`).
+Registration happens by calling `pthread_start(NULL, NULL)` — the kext's own
+"kext load" entry point, calling `pthread_kext_register()` under the hood —
+directly from `bsd_init.c`, right before the pre-existing `pthread_init()`
+call that dispatches through the now-populated table.
+
+Getting the vendored kext source to compile *as part of the kernel proper*
+(instead of its own isolated kext build) surfaced a string of real,
+independent bugs, each confirmed via an actual failing build or live panic,
+not guessed:
+1. **`proc_t`/`thread_t` not yet declared** when `kern_internal.h` reaches
+   `<sys/pthread_shims.h>` → `<sys/user.h>` → `resourcevar.h`/`signalvar.h` —
+   a real libpthread.kext build gets these for free from a prefix header;
+   fixed with an explicit `<sys/kernel_types.h>` include ahead of it.
+2. **Two same-named, differently-shaped `struct ksyn_waitq_element`
+   definitions.** xnu's own `bsd/sys/pthread_internal.h` (real, unmodified)
+   declares this as an *opaque* `char opaque[48]` — deliberately hiding the
+   real fields from ordinary kernel code, since only the kext needs them —
+   while libpthread's own `kern_internal.h` has the real field layout. Both
+   use the identical include guard (`_SYS_PTHREAD_INTERNAL_H_`, matching
+   Apple's own convention) and, on a real separate kext build, never appear
+   in the same translation unit at all. Compiled into one kernel image, they
+   collide: whichever header wins the `#ifndef` guard race supplies the
+   *only* definition for that whole translation unit. Fixed by moving the
+   real definition to the very top of `kern_internal.h` (ahead of
+   `<sys/pthread_shims.h>`) and, in `kern_support.c`/the renamed
+   `libpthread_kern_synch.c`, including `kern_internal.h` before anything
+   that could pull in the opaque version — the real struct wins every time,
+   which is what these two files actually need (`sys/user.h`'s union member
+   is the same size either way, so nothing else in the kernel is affected).
+3. **A genuine object-file basename collision.** `bsd/kern/kern_synch.c`
+   (real, unrelated BSD sleep/wakeup code) already claims the `kern_synch.o`
+   target — xnu's build flattens every object to its basename regardless of
+   source directory. `make` silently picked one rule ("overriding commands
+   for target `kern_synch.o`") and the vendored pthread file was never
+   actually being compiled at all, just silently dropped. Fixed by renaming
+   the vendored copy to `libpthread_kern_synch.c` on disk.
+4. **A duplicate sysctl registration, caught as a live panic**
+   (`"attempting to register a sysctl at previously registered slot : 110"`,
+   confirmed via serial console + backtrace, not guessed): `_pthread_init()`
+   explicitly calls `sysctl_register_oid(&sysctl__kern_pthread_mutex_default_policy)`,
+   which only made sense when that oid lived in a kext image invisible to
+   the kernel's own early sysctl auto-registration pass (which just scans
+   the kernel's own `__sysctl_set` linker-set section). Compiled directly
+   into the kernel, `SYSCTL_INT`'s `SYSCTL_LINKER_SET_ENTRY` already lands
+   it in that section, so the explicit call became a duplicate. Fixed by
+   deleting the now-redundant call.
+5. **Four smaller real signature/API drifts** between whatever xnu era
+   `libpthread-416` was written against and this specific `xnu-6153`:
+   `port_name_to_thread()` gained a `port_to_thread_options_t options`
+   parameter; `vm_kernel_unslide_or_perm_external()` now takes `vm_offset_t`
+   instead of `void *`; `vm_fault()` gained a `vm_tag_t wire_tag` parameter
+   under `XNU_KERNEL_PRIVATE`; four of the `pthread_kern->psynch_wait_*`
+   callbacks now take `uintptr_t kwq` instead of a raw `ksyn_wait_queue_t`
+   pointer (one call site, `psynch_wait_prepare`, already had the correct
+   cast — the rest didn't). Each fixed with a targeted cast/argument at the
+   call site, not a structural change.
+6. **Two duplicate-symbol link errors**: `pthread_kern` and
+   `current_uthread()` are *both* already defined natively in this xnu
+   (`bsd/pthread/pthread_shims.c`, `bsd/kern/kern_proc.c` respectively) —
+   another instance of functionality that used to live only in the kext
+   having been absorbed into xnu itself in this era. Fixed by deleting the
+   vendored kext's own (now-redundant) definitions and keeping only the
+   `extern`/prototype declarations.
+
+**Userland (`userland/libc/src/pthread.c`, `pthread_asm.S`,
+`pthread_syscalls.c`, `pthread_internal.h`)**: a real implementation built
+directly on the genuine `bsdthread_create`/`bsdthread_register`/
+`bsdthread_terminate` syscalls (raw wrappers in `pthread_syscalls.c`; the
+kernel's `_bsdthread_create()` register setup and `bsdthread_register(2)`'s
+7-argument-vs-6-register ABI — ground-truthed against
+`bsd/dev/i386/systemcalls.c`'s argument copyin, not guessed — needed a new
+`raw_syscall7` in `syscall_raw.h` that pushes a throwaway stack word ahead of
+the real 7th argument). `pthread_asm.S`'s `__pthread_start` is the actual
+address the kernel jumps to for every new thread (registered via
+`bsdthread_register`), landing in `__pthread_trampoline_c()` which runs the
+real `start_routine`.
+
+Deliberately **not** Apple's real psynch-backed userspace fast path (a
+whole generation-counter/kernel-waitqueue wire protocol of its own — see the
+kernel-side notes above for how deep that goes): `pthread_mutex_t` is a plain
+atomic-CAS spinlock with real owner/recursion tracking,
+`pthread_cond_t`/`pthread_rwlock_t` likewise use atomics and a spin-polled
+generation counter instead of blocking on the kernel. This is genuinely
+correct under xnu's real preemptive scheduler — a spinning thread's quantum
+expires and the lock-holding thread gets scheduled, true even on a single
+vCPU — just less efficient than a real futex/psynch wait. A documented v1
+simplification, not a fake, same spirit as dyld's "real but simplified"
+limitations in Phase 11.
+
+Since there's no dyld/kernel TLS wired up (`bsdthread_register()` is called
+with `tsd_offset=0`), "which thread is this" (`pthread_self()`,
+`pthread_getspecific()`/`setspecific()`) is answered by checking which
+registered thread's mmap'd stack range the current stack pointer falls in —
+every live thread is kept on a spinlock-protected registry recording its
+`[stack_lo, stack_hi)` bounds. This also made `errno` a live, real
+correctness bug the moment real concurrent threads existed (previously a
+single plain `int errno;` global, safe only because nothing was ever
+concurrent): converted to the standard glibc/musl `__errno_location()`
+macro pattern, reusing the same stack-range lookup, with every existing
+`errno` read/write across the tree continuing to work unchanged (macro
+substitution, no call-site changes needed). `userland/libc/src/malloc.c` had
+the identical problem — a real, unsynchronized global arena free-list — and
+got a plain spinlock around every public entry point for the same reason.
+
+A thread cannot safely `munmap()` the stack it's currently running on, so
+`bsdthread_terminate()` is called with `freesize=0` (the kernel does not try
+to reclaim it) and the stack is freed by whoever calls `pthread_join()` on
+that thread instead; detached threads' stacks are reclaimed opportunistically
+the next time `pthread_create()` runs (a real, if lazy, reclamation, not a
+leak by design). `pthread_key` destructors are not run at thread exit yet —
+an honest, documented gap, not a silent one.
+
+**Verified live in QEMU**, not assumed: `userland/pthread_test/` (built
+against the real `libSystem.B.dylib`, same pattern as Phase 12's `systest`)
+spawns 4 real threads each incrementing a shared counter 200,000 times under
+a `pthread_mutex_t`, joins them, and confirms the counter is *exactly*
+800,000 — zero lost updates under genuine concurrent execution, the load-
+bearing correctness signal a broken or no-op mutex would almost certainly
+fail — then exercises a `pthread_cond_wait`/`pthread_cond_signal` handoff
+between two threads. Installed as a `launchd` daemon
+(`com.asteros.pthreadtest.plist`, `KeepAlive`, same pattern as Phase 14's
+`echotest`) and confirmed via repeated QEMU monitor `screendump` captures
+(userspace stdout goes to the GOP console, not serial — serial only carries
+kernel `kprintf`) showing `PTHREADTEST PASS` on every single respawn cycle,
+across a from-scratch kernel + libSystem + image rebuild.
+
+**Known v1 limitations (documented, not oversights):**
+- Mutex/condvar/rwlock are spin-based, not blocking on the kernel — see above.
+- No real TLS; `errno`/TSD/`pthread_self()` all resolve via a stack-range
+  scan of a shared registry, which is O(n) in live thread count.
+- `sched_yield()` is still a no-op — real Darwin's goes through the
+  `swtch_pri()`/`thread_switch()` Mach trap, and no Mach traps are
+  implemented in this libc yet (a separate subsystem of its own).
+- `pthread_key_create()`'s destructor argument is accepted but never
+  invoked at thread exit.
+- Detached threads' stacks are freed lazily (next `pthread_create()` call),
+  not immediately at exit.
+
 ## Known deviations from a literal reading of the task (documented, not oversights)
 - ~~BusyBox → our own tiny multicall static binary~~ — superseded, see Phase 9 above.
 - ~~Root filesystem → MOCKFS + RAMDisk~~ — superseded: the actual root filesystem is

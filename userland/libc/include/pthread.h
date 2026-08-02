@@ -1,15 +1,20 @@
-/* There is exactly one schedulable context in this environment (no real
- * kernel thread-creation support -- see docs/architecture.md's "no
- * dyld/Libsystem" decision, same single-threaded philosophy). libc++ is
- * built with real threading enabled anyway (LIBCXX_ENABLE_THREADS=ON)
- * because LLVM's own Support library (ThreadPool.h, BalancedPartitioning.h)
- * unconditionally names std::mutex/std::condition_variable/std::future
- * regardless of LLVM_ENABLE_THREADS -- those types need a real pthread
- * ABI to exist, even though nothing here ever actually runs two threads
- * at once. Every primitive below is honestly correct for that single
- * schedulable context: mutexes track a recursion count instead of doing
- * real mutual exclusion (there is no second thread to exclude), and
- * pthread_create() honestly fails since we cannot create one. */
+/* Real pthreads: pthread_create() uses the genuine bsdthread_create(2)
+ * kernel entry point (see pthread.c, and the AsterOS libpthread_kern
+ * additions folded into the kernel -- xnu-6153 doesn't implement
+ * bsdthread_create/psynch_* itself, those normally live in a separate
+ * pthread.kext; this project has no kext loader, so real Apple
+ * libpthread-416's kernel component is statically linked into the
+ * kernel image instead and registered directly at boot). Threads are
+ * genuinely concurrent, kernel-scheduled execution contexts.
+ *
+ * Mutex/condvar/rwlock are deliberately NOT Apple's real psynch-backed
+ * userspace fast path (that wire protocol is a whole subsystem of its
+ * own) -- they're plain atomic-CAS spinlocks / a spin-polled generation
+ * counter instead. This is genuinely correct under xnu's real preemptive
+ * scheduler (a spinning thread's quantum expires and the lock-holding
+ * thread gets scheduled -- true even on a single vCPU), just less
+ * efficient than a real futex/psynch wait. A documented v1 simplification,
+ * not a fake: see pthread.c. */
 #ifndef _PTHREAD_H_
 #define _PTHREAD_H_
 
@@ -24,10 +29,13 @@ typedef struct {
 } pthread_mutexattr_t;
 
 typedef struct {
-	int locked;
+	volatile int owned;  /* 0 = unlocked, 1 = locked -- CAS spinlock bit */
+	void *owner;          /* struct __pthread* of the current holder, for recursive/error-checking */
+	int count;             /* recursion depth when type == PTHREAD_MUTEX_RECURSIVE */
+	int type;
 } pthread_mutex_t;
 
-#define PTHREAD_MUTEX_INITIALIZER { 0 }
+#define PTHREAD_MUTEX_INITIALIZER { 0, (void *)0, 0, 0 }
 #define PTHREAD_MUTEX_NORMAL     0
 #define PTHREAD_MUTEX_RECURSIVE  1
 #define PTHREAD_MUTEX_DEFAULT    PTHREAD_MUTEX_NORMAL
@@ -37,7 +45,7 @@ typedef struct {
 } pthread_condattr_t;
 
 typedef struct {
-	int unused;
+	volatile unsigned int gen; /* bumped by signal/broadcast; waiters spin-poll for a change */
 } pthread_cond_t;
 
 #define PTHREAD_COND_INITIALIZER { 0 }
@@ -52,8 +60,11 @@ typedef struct {
 	int detachstate;
 } pthread_attr_t;
 
+#define PTHREAD_CREATE_JOINABLE 0
+#define PTHREAD_CREATE_DETACHED 1
+
 typedef struct {
-	int locked;
+	volatile int state; /* 0 = unlocked, -1 = write-locked, N>0 = N readers */
 } pthread_rwlock_t;
 typedef struct {
 	int unused;
@@ -107,6 +118,8 @@ int pthread_attr_init(pthread_attr_t *attr);
 int pthread_attr_destroy(pthread_attr_t *attr);
 int pthread_attr_setstacksize(pthread_attr_t *attr, size_t stacksize);
 int pthread_attr_getstacksize(const pthread_attr_t *attr, size_t *stacksize);
+int pthread_attr_setdetachstate(pthread_attr_t *attr, int detachstate);
+int pthread_attr_getdetachstate(const pthread_attr_t *attr, int *detachstate);
 int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
     void *(*start_routine)(void *), void *arg);
 int pthread_join(pthread_t thread, void **retval);

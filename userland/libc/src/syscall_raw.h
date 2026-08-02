@@ -7,7 +7,7 @@
 #ifndef DARWINBUILD_SYSCALL_RAW_H
 #define DARWINBUILD_SYSCALL_RAW_H
 
-extern int errno;
+#include <errno.h>
 
 #define SYS_exit          1
 #define SYS_fork          2
@@ -59,6 +59,9 @@ extern int errno;
 #define SYS_gettimeofday  116
 #define SYS_getdirentries64 344
 #define SYS_getentropy    500
+#define SYS_bsdthread_create   360
+#define SYS_bsdthread_terminate 361
+#define SYS_bsdthread_register 366
 
 /* stat/fstat/lstat (syscalls 188/189/190) produce the OLD 32-bit-ino
  * struct layout (fstatat_internal()/fstat1() called with is64==0, see
@@ -192,6 +195,41 @@ raw_syscall6(long num, long a1, long a2, long a3, long a4, long a5, long a6)
 	    : "=a"(ret), "=qm"(cf)
 	    : "a"(0x2000000 | num), "r"(r_a1), "r"(r_a2), "r"(r_a3), "r"(r_a4), "r"(r_a5), "r"(r_a6)
 	    : "rcx", "r11", "memory");
+	g_syscall_cf = cf;
+	return ret;
+}
+
+/* Only bsdthread_register(2) needs this (7 real args -- see
+ * syscalls.master). The `syscall` instruction itself only has 6 argument
+ * registers (rdi,rsi,rdx,r10,r8,r9); xnu's generic argument copyin
+ * (bsd/dev/i386/systemcalls.c) reads anything beyond that from the user
+ * stack starting at rsp+8, not rsp+0 -- the +8 mirrors where a
+ * `call`-based (int 0x80-style) stub's real args would start, after its
+ * pushed return address. A bare `syscall` never pushes one, so we push a
+ * throwaway word first to hold that slot, then the real 7th argument,
+ * then clean both back off after -- ground-truthed against
+ * systemcalls.c's `copyin((user_addr_t)(regs->isf.rsp +
+ * sizeof(user_addr_t)), ...)`, not guessed. */
+static inline long
+raw_syscall7(long num, long a1, long a2, long a3, long a4, long a5, long a6, long a7)
+{
+	long ret;
+	char cf;
+	register long r_a1 __asm__("rdi") = a1;
+	register long r_a2 __asm__("rsi") = a2;
+	register long r_a3 __asm__("rdx") = a3;
+	register long r_a4 __asm__("r10") = a4;
+	register long r_a5 __asm__("r8") = a5;
+	register long r_a6 __asm__("r9") = a6;
+	__asm__ __volatile__(
+	    "pushq $0\n\t"
+	    "pushq %9\n\t"
+	    "syscall\n\t"
+	    "setc %1\n\t"
+	    "addq $16, %%rsp"
+	    : "=a"(ret), "=qm"(cf)
+	    : "a"(0x2000000 | num), "r"(r_a1), "r"(r_a2), "r"(r_a3), "r"(r_a4), "r"(r_a5), "r"(r_a6), "g"(a7)
+	    : "rcx", "r11", "memory", "cc");
 	g_syscall_cf = cf;
 	return ret;
 }

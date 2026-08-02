@@ -10,7 +10,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
 
-extern int errno;
 int h_errno;
 const char *hstrerror(int err) { (void)err; return "network not supported"; }
 

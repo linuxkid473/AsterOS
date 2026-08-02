@@ -6,7 +6,17 @@
 extern "C" {
 #endif
 
-extern int errno;
+/* errno is genuinely per-thread now that real pthreads exist (see
+ * pthread.c's __errno_location(), which resolves "which thread is this"
+ * by checking which registered thread's stack range the current stack
+ * pointer falls in -- there is no dyld/kernel TLS wired up to do this
+ * more cheaply). The main thread, and any code that runs before the
+ * first pthread_create(), falls through to a static fallback slot there.
+ * This is the standard glibc/musl-style errno-as-macro pattern; every
+ * existing `errno` read/write in this tree keeps working unchanged since
+ * macro substitution happens before the compiler ever sees a difference. */
+int *__errno_location(void);
+#define errno (*__errno_location())
 
 #define EPERM           1
 #define ENOENT          2

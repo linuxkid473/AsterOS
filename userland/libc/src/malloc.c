@@ -1,17 +1,41 @@
 /* Minimal malloc: a chain of mmap'd arena blocks, each with a first-fit
- * free list. No munmap-back-to-OS, no thread safety (we are
- * single-threaded -- no pthreads in this environment). Originally sized
- * as a single fixed 8MB block ("good enough for a shell + a handful of
- * coreutils applets"), which is far too small for a real linker (ld64)
- * processing multiple sizeable static archives -- that exhausted the
- * arena, returned NULL, and surfaced as an uncaught std::bad_alloc.
- * Growing by mmap'ing another block on exhaustion, rather than just
- * raising the fixed size, means this no longer silently breaks again
- * the next time something bigger comes along. */
+ * free list. No munmap-back-to-OS. Originally sized as a single fixed
+ * 8MB block ("good enough for a shell + a handful of coreutils
+ * applets"), which is far too small for a real linker (ld64) processing
+ * multiple sizeable static archives -- that exhausted the arena,
+ * returned NULL, and surfaced as an uncaught std::bad_alloc. Growing by
+ * mmap'ing another block on exhaustion, rather than just raising the
+ * fixed size, means this no longer silently breaks again the next time
+ * something bigger comes along.
+ *
+ * Thread safety: real pthreads now exist (pthread.c), so every public
+ * entry point below takes g_malloc_lock -- a plain atomic-CAS spinlock,
+ * not a pthread_mutex_t (this file must not depend on pthread.c, which
+ * itself calls malloc()). Internal helpers with a _nolock suffix assume
+ * the caller already holds it; callers that build on top of another
+ * public entry point's logic (calloc, aligned_alloc) take the lock once
+ * themselves and call the _nolock forms directly instead of recursing
+ * into the public (locking) ones, since the spinlock isn't recursive. */
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <stdint.h>
+
+static int g_malloc_lock;
+
+static void
+malloc_lock(void)
+{
+	while (__atomic_exchange_n(&g_malloc_lock, 1, __ATOMIC_ACQUIRE)) {
+		__asm__ __volatile__("pause" ::: "memory");
+	}
+}
+
+static void
+malloc_unlock(void)
+{
+	__atomic_store_n(&g_malloc_lock, 0, __ATOMIC_RELEASE);
+}
 
 /* Header is padded to 32 bytes (a multiple of 16) so that a payload
  * immediately following it stays 16-byte aligned whenever the payload
@@ -70,8 +94,8 @@ align16(size_t n)
 	return (n + 15) & ~(size_t)15;
 }
 
-void *
-malloc(size_t size)
+static void *
+malloc_nolock(size_t size)
 {
 	arena_init();
 	if (size == 0) {
@@ -121,8 +145,8 @@ malloc(size_t size)
 	return (void *)(fresh + 1);
 }
 
-void
-free(void *ptr)
+static void
+free_nolock(void *ptr)
 {
 	if (!ptr) {
 		return;
@@ -141,16 +165,35 @@ free(void *ptr)
 }
 
 void *
+malloc(size_t size)
+{
+	malloc_lock();
+	void *p = malloc_nolock(size);
+	malloc_unlock();
+	return p;
+}
+
+void
+free(void *ptr)
+{
+	malloc_lock();
+	free_nolock(ptr);
+	malloc_unlock();
+}
+
+void *
 calloc(size_t nmemb, size_t size)
 {
 	size_t total = nmemb * size;
 	if (nmemb != 0 && total / nmemb != size) {
 		return (void *)0; /* overflow */
 	}
-	void *p = malloc(total);
+	malloc_lock();
+	void *p = malloc_nolock(total);
 	if (p) {
 		memset(p, 0, total);
 	}
+	malloc_unlock();
 	return p;
 }
 
@@ -164,16 +207,20 @@ realloc(void *ptr, size_t size)
 		free(ptr);
 		return (void *)0;
 	}
+	malloc_lock();
 	struct chunk *c = (struct chunk *)ptr - 1;
 	if (c->size >= size) {
+		malloc_unlock();
 		return ptr;
 	}
-	void *n = malloc(size);
+	void *n = malloc_nolock(size);
 	if (!n) {
+		malloc_unlock();
 		return (void *)0;
 	}
 	memcpy(n, ptr, c->size);
-	free(ptr);
+	free_nolock(ptr);
+	malloc_unlock();
 	return n;
 }
 
@@ -197,8 +244,10 @@ aligned_alloc(size_t alignment, size_t size)
 	if (alignment <= 8) {
 		return malloc(size);
 	}
-	void *raw = malloc(size + alignment + sizeof(struct chunk));
+	malloc_lock();
+	void *raw = malloc_nolock(size + alignment + sizeof(struct chunk));
 	if (!raw) {
+		malloc_unlock();
 		return (void *)0;
 	}
 	uintptr_t aligned = ((uintptr_t)raw + sizeof(struct chunk) + alignment - 1) &
@@ -213,5 +262,6 @@ aligned_alloc(size_t alignment, size_t size)
 	orig->size = front_waste - sizeof(struct chunk);
 	orig->free = 1;
 	orig->next = newc;
+	malloc_unlock();
 	return (void *)aligned;
 }

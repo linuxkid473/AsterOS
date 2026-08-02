@@ -8,7 +8,6 @@
 #include <stddef.h>
 #include <errno.h>
 
-extern int errno;
 
 void *dlopen(const char *path, int mode) { (void)path; (void)mode; errno = ENOSYS; return NULL; }
 int   dlclose(void *handle) { (void)handle; errno = ENOSYS; return -1; }
