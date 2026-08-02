@@ -47,6 +47,9 @@ if [ -f build/launchd_test/echotest ]; then
 	echo "echotest found in build/ -- including it in the rootfs"
 	mcopy -i "$ROOTFS_IMG" build/launchd_test/echotest ::/bin/echotest
 fi
+if [ -f build/corefoundation_obj/cftest ]; then
+	mcopy -i "$ROOTFS_IMG" userland/launchd/daemons/com.asteros.cftest.plist ::/etc/launchd/daemons/com.asteros.cftest.plist
+fi
 
 DYLD_BIN="build/dyld_obj/dyld"
 LIBSYSTEM_REAL="build/libSystem_obj/libSystem.B.dylib"
@@ -75,6 +78,11 @@ if [ -f "$DYLD_BIN" ]; then
 		echo "libobjc found in build/ -- including it in the rootfs"
 		mcopy -i "$ROOTFS_IMG" build/libobjc_obj/libobjc.A.dylib ::/usr/lib/libobjc.A.dylib
 		mcopy -i "$ROOTFS_IMG" build/libobjc_obj/objctest ::/bin/objctest
+	fi
+	if [ -f build/corefoundation_obj/libCoreFoundation.dylib ] && [ -f build/corefoundation_obj/cftest ]; then
+		echo "CoreFoundation found in build/ -- including it in the rootfs"
+		mcopy -i "$ROOTFS_IMG" build/corefoundation_obj/libCoreFoundation.dylib ::/usr/lib/libCoreFoundation.dylib
+		mcopy -i "$ROOTFS_IMG" build/corefoundation_obj/cftest ::/bin/cftest
 	fi
 fi
 

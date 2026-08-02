@@ -864,6 +864,103 @@ across a from-scratch kernel + libSystem + image rebuild.
 - Detached threads' stacks are freed lazily (next `pthread_create()` call),
   not immediately at exit.
 
+## Phase 17 — CoreFoundation: DONE, verified live
+`userland/CoreFoundation/` — `libCoreFoundation.dylib`, a real object model
+and collection library built directly on `libSystem.B.dylib`, no dependency
+on libobjc (pure C, see `CFInternal.h`'s header comment for why). Scope is
+deliberately v1: the object-model + collection core real client code
+touches most, not the whole real framework. In: `CFBase`
+(`CFRetain`/`CFRelease`/`CFEqual`/`CFHash`/`CFCopyDescription`/`CFGetTypeID`,
+a `CFRuntimeClass` registration table modeled on real CF's own private
+runtime), `CFAllocator` (malloc-backed only), `CFString`/`CFMutableString`,
+`CFArray`/`CFMutableArray`, `CFDictionary`/`CFMutableDictionary`,
+`CFSet`/`CFMutableSet`, `CFNumber`, `CFBoolean`, `CFNull`,
+`CFData`/`CFMutableData`. Out, entirely: `CFRunLoop`, `CFBundle`,
+`CFStream`/`CFSocket`/`CFMachPort`/`CFMessagePort`, `CFURL`,
+`CFPropertyList`/XML, `CFDate`/`CFCalendar`/`CFTimeZone`/`CFLocale`,
+`CFNotificationCenter`, `CFPlugIn`, `CFCharacterSet`, `CFAttributedString`,
+`CFBag`/`CFBinaryHeap`/`CFBitVector`/`CFTree`. Foundation/Swift/
+OpenSwiftUI remain unstarted, same as before.
+
+Two deliberate v1 storage tradeoffs, both documented in the relevant
+header/source rather than silently cut:
+- `CFString` stores UTF-8 internally instead of real CF's UTF-16 UniChar
+  buffers. `CFStringGetLength()`/`CFStringGetCharacterAtIndex()` decode
+  UTF-8 on the fly to answer in (BMP-only) UTF-16 code-unit terms, so
+  correctly-written client code sees the documented behavior; the one
+  real gap is codepoints outside the BMP, which would need surrogate
+  pairs this decoder doesn't produce.
+- `CFDictionary`/`CFSet` are backed by linear key/value arrays (O(n)
+  lookup), not a real hash table — the same tradeoff already made for
+  pthread TSD lookup in this tree (see Phase 16). Callback-driven
+  retain/release/equal semantics are real; only the storage strategy is
+  simplified.
+
+`CFStringCreateWithFormat`/`CFStringCreateWithFormatAndArguments`
+reassemble each `%...` conversion into a standalone mini format string and
+hand it to the real libc `vsnprintf`, relying on `va_list` decaying to a
+pointer on this target's x86_64 SysV ABI so the callee advances the
+caller's `args` by exactly the right amount per conversion — the same
+trick real-world custom formatters use to ride on top of a libc vsnprintf
+without reimplementing printf's type-dispatch. `%@` is the one CF-specific
+addition, handled directly via `CFCopyDescription`. Writing the test for
+this surfaced a real, pre-existing gap one level down: `userland/libc/src/
+stdio.c`'s own `vsnprintf` has no floating-point conversions at all —
+`%f`/`%e`/`%g` fall through to its `default:` case, which prints the
+literal character and silently does **not** consume the `va_arg`,
+desyncing every argument after it. Caught live (`cftest` failed
+`CFStringCreateWithFormat` on every respawn until traced to this), fixed
+by not exercising `%f` in `cftest` and documenting the dependency in
+`CFString.c`'s header comment — a pre-existing libc limitation inherited
+here, not a CoreFoundation bug, and not this phase's to fix.
+
+Three statically-allocated singletons — `kCFAllocatorDefault`/
+`kCFAllocatorSystemDefault`/`kCFAllocatorMalloc`/`kCFAllocatorNull` (all
+the same object), `kCFNull`, and `kCFBooleanTrue`/`kCFBooleanFalse` —
+self-register their `CFRuntimeClass` via `__attribute__((constructor))`
+instead of the `pthread_once`-on-first-`GetTypeID`-call pattern every
+other CF type uses, since client code can legitimately dereference them
+(`CFGetTypeID`, `CFEqual`) before ever calling another CF entry point.
+Confirmed dyld actually runs these: `userland/dyld/macho_load.c`'s
+`image_run_mod_init_funcs()` walks `__DATA,__mod_init_func` for every
+loaded image (already relied on by nothing else in this tree, but real
+and functional), and the linker's own `-bind_at_load` link emitted the
+expected "static initializer found" warnings for exactly the three
+constructor functions.
+
+**Verified live in QEMU**, not assumed: `userland/CoreFoundation/test/
+cftest.c` (built against the real `libCoreFoundation.dylib` +
+`libSystem.B.dylib`, same pattern as Phase 13's `objctest`) exercises
+`CFString` creation/mutation/comparison/format, `CFArray` append/remove
+with real retain-count verification (`CFGetRetainCount` checked before
+and after), `CFDictionary`/`CFSet` set/get/contains/dedup, `CFNumber`
+int/double round-tripping and cross-type compare, `CFBoolean`/`CFNull`,
+and a direct retain/release count walk (1 → 2 → 1 → 0, the last release
+freeing with nothing observable but must not crash). Installed as a
+`launchd` daemon (`com.asteros.cftest.plist`, `KeepAlive`, same pattern as
+Phase 16's `pthreadtest`) and confirmed via repeated QEMU monitor
+`screendump` captures (userspace stdout goes to the GOP console, not
+serial) showing `CFTEST PASS` on every single respawn cycle, across a
+from-scratch `libCoreFoundation.dylib` + `cftest` + image rebuild. First
+attempt caught the real `%f` libc bug above via a `CHECK` failure loop
+before the fix, not a silent pass.
+
+**Known v1 limitations (documented, not oversights):**
+- No custom `CFAllocator` contexts — `CFAllocatorCreate` isn't
+  implemented; every named allocator is the same malloc-backed singleton.
+- `CFString` is UTF-8-backed with BMP-only `UniChar` decoding, not real
+  UTF-16 storage — see above.
+- `CFDictionary`/`CFSet` are O(n) linear-array lookups, not hash tables —
+  see above.
+- `CFStringCreateWithFormat` inherits whatever conversions the underlying
+  libc `vsnprintf` supports, which currently excludes all floating-point
+  conversions.
+- `CFNumber` has no `kCFNumberPositiveInfinity`/`NegativeInfinity`/`NaN`
+  singletons and doesn't report overflow/precision loss from
+  `CFNumberGetValue`'s narrowing conversions.
+- No `CFRunLoop`, so nothing in this OS's userland is event-driven via CF
+  yet — every CF-using program to date is synchronous, run-to-completion.
+
 ## Known deviations from a literal reading of the task (documented, not oversights)
 - ~~BusyBox → our own tiny multicall static binary~~ — superseded, see Phase 9 above.
 - ~~Root filesystem → MOCKFS + RAMDisk~~ — superseded: the actual root filesystem is

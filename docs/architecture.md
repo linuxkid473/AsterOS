@@ -27,7 +27,7 @@ Used for the native-Clang bring-up (see TODO.md Phase 10) — an independent, mu
 Building real dyld + Libsystem + objc4 + full Libc is a multi-month undertaking on its own (ravynOS spent ~6 months and still lacked working input). XNU's exec path only invokes dyld when a Mach-O has `LC_LOAD_DYLINKER`. A statically-linked Mach-O with no dylib load commands is exec'd directly by the kernel with no userspace runtime dependency at all.
 **Decision:** write our own tiny raw-syscall "libc" (BSD syscall ABI: syscall class 2 → `(0x2000000 | number)` in `%rax`, args in `%rdi,%rsi,%rdx,%r10,%r8,%r9`, `syscall` instruction, carry flag set on error) and build our coreutils/shell as static Mach-O against it. This *is* the "tiny userspace" / BusyBox-equivalent phase — documented here as a deliberate deviation from literally porting upstream BusyBox (which targets a real libc/dyld environment we're not building).
 
-**Superseded**: a real, from-scratch dyld (`userland/dyld/`) now exists and is verified live in QEMU — see `TODO.md` Phase 11 for what it does, the ASLR-slide/position-independence gotcha that cost the most time, and its known v1 limitations (no lazy binding exercised yet, no real libSystem, fixed-slot dylib placement). A real libSystem.dylib also now exists (`userland/libSystem/`, wrapping `userland/libc/`) — see `TODO.md` Phase 12. A real libobjc (`userland/libobjc/`, genuine nonfragile-ABI2 metadata layout, real `.m` files compile and run unmodified) also now exists — see `TODO.md` Phase 13 and the libobjc decision section below. A real launchd (`userland/launchd/`, replacing `userland/init_launcher.c` as PID 1) also now exists — see `TODO.md` Phase 14; every layer of the originally-planned Mach Kernel → BSD/VM/IPC → Mach-O Loader → dyld → libSystem → libobjc → launchd stack is now real. Static, dyld-free linking remains the default for anything that doesn't need a shared dependency — BusyBox/coreutils were deliberately *not* migrated to dynamic linking when libSystem landed, to avoid touching the already-verified Phase 9 boot path.
+**Superseded**: a real, from-scratch dyld (`userland/dyld/`) now exists and is verified live in QEMU — see `TODO.md` Phase 11 for what it does, the ASLR-slide/position-independence gotcha that cost the most time, and its known v1 limitations (no lazy binding exercised yet, no real libSystem, fixed-slot dylib placement). A real libSystem.dylib also now exists (`userland/libSystem/`, wrapping `userland/libc/`) — see `TODO.md` Phase 12. A real libobjc (`userland/libobjc/`, genuine nonfragile-ABI2 metadata layout, real `.m` files compile and run unmodified) also now exists — see `TODO.md` Phase 13 and the libobjc decision section below. A real launchd (`userland/launchd/`, replacing `userland/init_launcher.c` as PID 1) also now exists — see `TODO.md` Phase 14; every layer of the originally-planned Mach Kernel → BSD/VM/IPC → Mach-O Loader → dyld → libSystem → libobjc → launchd stack is now real. Real pthreads (`userland/libc/src/pthread.c`, kernel-side `libpthread_kern_synch.c` folded into xnu) exist too — see `TODO.md` Phase 16 — and a real, v1-scoped CoreFoundation (`userland/CoreFoundation/`) exists on top of it all — see `TODO.md` Phase 17 and the CoreFoundation decision section below. Static, dyld-free linking remains the default for anything that doesn't need a shared dependency — BusyBox/coreutils were deliberately *not* migrated to dynamic linking when libSystem landed, to avoid touching the already-verified Phase 9 boot path.
 
 ## Decision: libobjc ABI-compatibility scope (see TODO.md Phase 13)
 The on-disk metadata clang emits for an `.m` file — `class_t`/`class_ro_t`/
@@ -64,6 +64,33 @@ One real semantic requirement, not a simplification: ARC's
 necessary for correctness, not an optional performance trick — ground-
 truthed with a double-free bug during Phase 13 verification. Full account
 in `TODO.md` Phase 13 and the comments in `arc.c`/`autorelease.c`.
+
+## Decision: CoreFoundation scope (see TODO.md Phase 17)
+`userland/CoreFoundation/` is a real object model and collection library —
+genuine `CFRetain`/`CFRelease` refcounting, real callback-driven
+`CFArray`/`CFDictionary`/`CFSet`, real `CFString` mutation — but
+deliberately v1-scoped to the object-model + collection core real client
+code touches most: `CFBase`, `CFAllocator`, `CFString`, `CFArray`,
+`CFDictionary`, `CFSet`, `CFNumber`, `CFBoolean`, `CFNull`, `CFData`. No
+`CFRunLoop` (nothing in this OS's userland is event-driven via CF yet —
+every CF-using program is synchronous, run-to-completion), no `CFBundle`,
+no networking (`CFStream`/`CFSocket`/`CFMachPort`/`CFMessagePort`), no
+`CFURL`, no `CFPropertyList`/XML, no internationalization types
+(`CFDate`/`CFCalendar`/`CFTimeZone`/`CFLocale`), no `CFNotificationCenter`
+or `CFPlugIn`. Pure C, not built on the Objective-C runtime — real CF can
+optionally use objc internally, but there's no toll-free-bridging need
+here since Foundation doesn't exist in this OS yet, so `libCoreFoundation.
+dylib` has no dependency on `libobjc.A.dylib` at all.
+
+Two storage tradeoffs, in the same spirit as pthread's spin-based mutex
+(real semantics, simplified backing data structure): `CFString` stores
+UTF-8 instead of real CF's UTF-16 UniChar buffers (length/character-index
+queries decode on the fly; codepoints outside the BMP are the one real
+gap), and `CFDictionary`/`CFSet` are linear key/value arrays instead of a
+hash table (O(n) lookup, same tradeoff Phase 16 already made for pthread
+TSD). Full account, including the pre-existing libc `vsnprintf`
+floating-point gap `CFStringCreateWithFormat` surfaced, in `TODO.md`
+Phase 17.
 
 ## Decision: root filesystem = MOCKFS + in-memory RAMDisk (no disk driver at all)
 Investigated three options:
