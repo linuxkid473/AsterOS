@@ -23,9 +23,11 @@ These are needed only to get xnu's own build to compile (headers + ctf tools + l
 
 Used for the native-Clang bring-up (see TODO.md Phase 10) — an independent, much larger undertaking from the kernel/userspace pins above. Cross-built from the host's Apple clang 21 targeting `x86_64-apple-macos10.15`, same toolchain pattern as everything else in this project.
 
-## Decision: no dyld / no Libsystem in userspace
+## Decision: no dyld / no Libsystem in userspace — superseded, see TODO.md Phase 11
 Building real dyld + Libsystem + objc4 + full Libc is a multi-month undertaking on its own (ravynOS spent ~6 months and still lacked working input). XNU's exec path only invokes dyld when a Mach-O has `LC_LOAD_DYLINKER`. A statically-linked Mach-O with no dylib load commands is exec'd directly by the kernel with no userspace runtime dependency at all.
 **Decision:** write our own tiny raw-syscall "libc" (BSD syscall ABI: syscall class 2 → `(0x2000000 | number)` in `%rax`, args in `%rdi,%rsi,%rdx,%r10,%r8,%r9`, `syscall` instruction, carry flag set on error) and build our coreutils/shell as static Mach-O against it. This *is* the "tiny userspace" / BusyBox-equivalent phase — documented here as a deliberate deviation from literally porting upstream BusyBox (which targets a real libc/dyld environment we're not building).
+
+**Superseded**: a real, from-scratch dyld (`userland/dyld/`) now exists and is verified live in QEMU — see `TODO.md` Phase 11 for what it does, the ASLR-slide/position-independence gotcha that cost the most time, and its known v1 limitations (no lazy binding exercised yet, no real libSystem, fixed-slot dylib placement). Still no Libsystem/objc4/full Libc — this decision's rejection of *those* stands; only the "no dyld at all" half was reversed. Static, dyld-free linking remains the default for anything that doesn't need a shared dependency (BusyBox, coreutils, the shell).
 
 ## Decision: root filesystem = MOCKFS + in-memory RAMDisk (no disk driver at all)
 Investigated three options:

@@ -324,6 +324,61 @@ first one that will actually try to compile and link real LLVM C++
 source against `userland/libc/`'s headers — expect the first real
 libc-gap errors there, not before.
 
+## Phase 11 — dyld (dynamic linker): DONE, verified live in QEMU
+Real dyld, from scratch (`userland/dyld/`) — not the deferred-forever stub the
+Phase 1 roadmap and `docs/architecture.md`'s "no dyld" decision originally
+called for. Loads LC_LOAD_DYLIB dependencies from disk, rebases (REBASE_OPCODE_*),
+binds (BIND_OPCODE_*, both eager and a real lazy `dyld_stub_binder` path), and
+resolves symbols via the export trie (LC_DYLD_INFO_ONLY), all interpreted
+against the vendored `mach-o/loader.h`. Kernel side needed zero changes —
+`mach_loader.c`'s `load_dylinker()`/LC_LOAD_DYLINKER handling was already fully
+present and correct, ground-truthed by reading it before writing a line of
+dyld code (see the file-by-file breakdown that motivated this phase).
+
+**Verified live**: `build/dyld_obj/dyntest`, a normal libc-based executable
+with `LC_LOAD_DYLINKER=/usr/lib/dyld` and `LC_LOAD_DYLIB=/usr/lib/libtest.dylib`,
+boots, dyld loads `libtest.dylib` (and its own `/usr/lib/libSystem.B.dylib`
+placeholder dependency, see below), calls a function and reads a `const char *`
+exported from the dylib correctly, printing `DYNTEST PASS` — confirmed across
+multiple runs with different kernel-chosen ASLR slides in one boot session.
+
+**The one real bug, and why it mattered**: mach_loader.c *always* computes and
+applies an ASLR slide to the dylinker specifically, regardless of the MH_PIE
+bit or a `-no_pie` link (first-hand ground-truth, not something the architecture
+doc predicted). dyld must therefore be genuine position-independent code — every
+internal reference RIP-relative, correct at any load address with zero fixups of
+its own — not just "linked at a fixed non-PIE address," which was the original
+(wrong) plan. Getting this fully right needed **both** `-fPIC` (forces
+RIP-relative codegen instead of absolute addresses) **and** `-fvisibility=hidden`
+plus explicit `__attribute__((visibility("hidden")))` on every cross-TU `extern`
+(`g_images`, `_mh_dylinker_header`, `_dyld_stub_binder_entry`) — without the
+latter, clang still routes non-hidden externs through a GOT slot that only a
+rebase pass would populate, and dyld can never rebase itself (it's the one
+providing rebase to everyone else). Confirmed fixed by checking dyld's own
+`LC_DYLD_INFO_ONLY` is emitted with `rebase_size 0` — dyld needs *zero* fixups,
+same as real dyld.
+
+**Known limitations / deliberate v1 simplifications**:
+- Lazy binding (`stub_binder.c`/`stub_binder_asm.S`) is real and ground-truthed
+  against ld64's actual `stub_x86_64.hpp` codegen, but *unexercised*: the host's
+  modern ld64 segfaults (`IndirectSymbolTableBuilderImpl`, an internal
+  `_sideInfo` assertion in `Atom.h`) building lazy stubs without a real
+  libSystem providing `dyld_stub_binder`, so `userland/dyld/test/build.sh`
+  links with `-bind_at_load` (eager binds only) to sidestep it. Fixing this
+  needs either a linker that doesn't crash here (maybe the native ld64 once
+  Phase 10 lands) or a from-scratch stub-generation workaround.
+- No real libSystem, ever — but the host's ld64 hard-refuses to build *any*
+  dynamic executable/dylib without linking something named libSystem (checked
+  empirically, applies even to an otherwise-empty dylib). Worked around with a
+  hand-authored, link-time-only `libSystem_stub.tbd` (zero real symbols) plus a
+  real empty placeholder Mach-O shipped at `/usr/lib/libSystem.B.dylib` that
+  dyld loads like any other dependency and never actually needs anything from.
+- Dylib placement is fixed 256MB slots (`g_next_dylib_base`), not a real VM
+  allocator — fine for a handful of dylibs, not a general-purpose scheme.
+- No `@rpath`/`@loader_path`, no two-level-namespace subtlety beyond ordinal
+  bind, no weak symbols/re-exports, no `mprotect` re-protection after fixups
+  (segments stay RWX — no mprotect syscall wired up yet).
+
 ## Known deviations from a literal reading of the task (documented, not oversights)
 - ~~BusyBox → our own tiny multicall static binary~~ — superseded, see Phase 9 above.
 - ~~Root filesystem → MOCKFS + RAMDisk~~ — superseded: the actual root filesystem is
