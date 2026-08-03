@@ -221,9 +221,85 @@ strtoul(const char *nptr, char **endptr, int base)
 
 long long strtoll(const char *nptr, char **endptr, int base) { return strtol(nptr, endptr, base); }
 unsigned long long strtoull(const char *nptr, char **endptr, int base) { return strtoul(nptr, endptr, base); }
-double strtod(const char *nptr, char **endptr) { if (endptr) { *endptr = (char *)nptr; } return 0.0; }
-float strtof(const char *nptr, char **endptr) { if (endptr) { *endptr = (char *)nptr; } return 0.0f; }
-long double strtold(const char *nptr, char **endptr) { if (endptr) { *endptr = (char *)nptr; } return 0.0L; }
+
+/* Was a hard 0.0 stub until Foundation's JSON/plist real-number parsing
+ * (userland/Foundation/NSJSONSerialization.m, NSPropertyListSerialization.m)
+ * and NSString -doubleValue both turned out to depend on it -- caught
+ * live in QEMU (FOUNDATIONTEST FAIL: doubleValue), not a hypothetical.
+ * Unlike userland/CoreFoundation/CFString.c's documented vsnprintf %f
+ * gap (a va_list-mechanics problem with no simple fix), this is a
+ * plain, self-contained parser worth actually implementing rather than
+ * routing around: sign, integer digits, fractional digits, optional
+ * e/E exponent. Not bit-exact/correctly-rounded like a reference libm
+ * (each digit is folded in via repeated *10.0 accumulation, not exact
+ * decimal-to-binary conversion) -- fine for every real caller in this
+ * tree, none of which need IEEE754 last-bit precision. */
+double
+strtod(const char *nptr, char **endptr)
+{
+	const char *p = nptr;
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\f' || *p == '\v') {
+		p++;
+	}
+	int neg = 0;
+	if (*p == '+' || *p == '-') {
+		neg = (*p == '-');
+		p++;
+	}
+	double mantissa = 0.0;
+	int anyDigits = 0;
+	while (*p >= '0' && *p <= '9') {
+		mantissa = mantissa * 10.0 + (double)(*p - '0');
+		p++;
+		anyDigits = 1;
+	}
+	if (*p == '.') {
+		p++;
+		double frac = 0.1;
+		while (*p >= '0' && *p <= '9') {
+			mantissa += (double)(*p - '0') * frac;
+			frac *= 0.1;
+			p++;
+			anyDigits = 1;
+		}
+	}
+	if (!anyDigits) {
+		if (endptr) {
+			*endptr = (char *)nptr;
+		}
+		return 0.0;
+	}
+	if (*p == 'e' || *p == 'E') {
+		const char *q = p + 1;
+		int expNeg = 0;
+		if (*q == '+' || *q == '-') {
+			expNeg = (*q == '-');
+			q++;
+		}
+		if (*q >= '0' && *q <= '9') {
+			int exp = 0;
+			while (*q >= '0' && *q <= '9') {
+				exp = exp * 10 + (*q - '0');
+				q++;
+			}
+			double scale = 1.0;
+			for (int i = 0; i < exp; i++) {
+				scale *= 10.0;
+			}
+			mantissa = expNeg ? mantissa / scale : mantissa * scale;
+			p = q;
+		}
+		/* else: "e"/"E" not followed by digits -- not a valid exponent,
+		 * leave p where it was (don't consume the 'e'). */
+	}
+	if (endptr) {
+		*endptr = (char *)p;
+	}
+	return neg ? -mantissa : mantissa;
+}
+
+float strtof(const char *nptr, char **endptr) { return (float)strtod(nptr, endptr); }
+long double strtold(const char *nptr, char **endptr) { return (long double)strtod(nptr, endptr); }
 
 int atoi(const char *s) { return (int)strtol(s, (void *)0, 10); }
 long atol(const char *s) { return strtol(s, (void *)0, 10); }

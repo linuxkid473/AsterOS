@@ -10,6 +10,8 @@
 #include <stdlib.h>
 
 extern const char *__libc_argv0;
+extern int __libc_argc;
+extern char **__libc_argv;
 void __init_stack_chk_guard(void);
 void __init_default_rune_locale(void);
 
@@ -40,6 +42,8 @@ __libc_start(int argc, char **argv, char **envp)
 	__init_stack_chk_guard(); /* before anything stack-protector-instrumented runs */
 	environ = envp;
 	__libc_argv0 = argc > 0 ? argv[0] : "";
+	__libc_argc = argc;
+	__libc_argv = argv;
 	__init_default_rune_locale();
 	run_mod_init_funcs();
 	int rc = main(argc, argv, envp);

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.asteros.foundationtest</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/foundationtest</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>FOUNDATIONTEST_VAR</key>
+		<string>present</string>
+	</dict>
+</dict>
+</plist>

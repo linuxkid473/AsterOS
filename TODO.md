@@ -961,6 +961,203 @@ before the fix, not a silent pass.
 - No `CFRunLoop`, so nothing in this OS's userland is event-driven via CF
   yet — every CF-using program to date is synchronous, run-to-completion.
 
+## Phase 18 — Foundation: DONE, verified live (with documented gaps)
+`userland/Foundation/` — a real `libFoundation.dylib`, genuine Objective-C
+classes wrapping CoreFoundation via toll-free bridging, not a parallel
+reimplementation. Depends only on `libobjc.A.dylib` + `libCoreFoundation.
+dylib` + `libSystem.B.dylib`. In: `NSObject` (new root class, not
+libobjc's bare `Object` — see below), `NSString`/`NSMutableString`
+(bridged to `CFString`), `NSNumber`/`NSNull` (bridged to
+`CFNumber`/`CFBoolean`/`CFNull`), `NSArray`/`NSMutableArray`,
+`NSDictionary`/`NSMutableDictionary`, `NSSet`/`NSMutableSet` (all bridged
+to their CF counterparts), `NSData`/`NSMutableData` (bridged to
+`CFData`), `NSError`, `NSException` (+ `NS_DURING`/`NS_HANDLER`/
+`NS_ENDHANDLER`, not `@try/@catch/@throw` — see below), `NSDate`/
+`NSTimeZone`/`NSLocale`/`NSURL` (bridged to four new small CF types added
+this phase: `CFDate`, `CFTimeZone`, `CFLocale`, `CFURL`), `NSFileManager`,
+`NSBundle`, `NSProcessInfo`, `NSNotificationCenter`, `NSRunLoop` (minimal,
+`poll()`-backed), `NSCoder`/`NSKeyedArchiver`/`NSKeyedUnarchiver`
+(XML-plist-backed), `NSPropertyListSerialization`, `NSJSONSerialization`,
+`NSUserDefaults`.
+
+**Toll-free bridging, the real mechanism, not a facade:** `CFRuntimeBase`
+(`userland/CoreFoundation/CFInternal.h`) now starts with a literal `void
+*isa` field matching libobjc's `struct objc_object` layout exactly, so a
+bridged `CFStringRef` cast to `id` is a genuinely dispatchable Objective-C
+object. A new CF entry point, `_CFRuntimeBridgeClasses(CFTypeID, void
+*isaClass)`, registers each CF/NS pair's `isa`; Foundation calls it once
+per pair at load time via a constructor (`FoundationInit.m`). Each
+`NSCFFoo` (e.g. `NSCFString`) is a private concrete subclass of the
+public abstract class that forwards `-retain`/`-release`/`-retainCount`/
+`-hash`/`-isEqual:`/`-description` directly into `CFRetain`/`CFRelease`/
+`CFGetRetainCount`/`CFHash`/`CFEqual`/`CFCopyDescription` — retain counts
+and equality are identical whether an object is touched through CF or NS
+API. `NSMutableFoo` shares the same backing struct as `NSFoo` (already
+true of `CFArrayRef`/`CFMutableArrayRef` etc. in this tree's CF), so no
+separate mutable subclass is needed.
+
+One real, non-obvious ordering bug this surfaced: dyld runs a
+dependency's constructors before its dependents' (CF before Foundation),
+so CF's own self-registering singletons (`kCFNull`,
+`kCFBooleanTrue`/`False`, see Phase 17) always construct *before*
+Foundation can register bridge classes, leaving their `isa` permanently
+NULL under the natural init order. Fixed with a retroactive-patch
+primitive, `_CFRuntimeSetInstanceISA(CFTypeRef, void *)`, that Foundation
+calls on these specific pre-existing singletons after registering their
+bridge class.
+
+Non-bridged classes (`NSError`, `NSException`, `NSProcessInfo`,
+`NSFileManager`, `NSBundle`, `NSNotificationCenter`, `NSRunLoop`,
+`NSCoder`/`NSKeyedArchiver`/`NSKeyedUnarchiver`, `NSUserDefaults`) are
+plain `NSObject`-ivar-backed classes — real Foundation has plenty of
+these too; toll-free bridging is specifically a CF/NS *pair* thing.
+`NSAutoreleasePool` is not redeclared here — it already exists, real and
+complete, in `libobjc.A.dylib` (Phase 13); Foundation just documents that.
+
+**Real bugs found and fixed this phase, each caught live in QEMU (not
+code review):**
+1. `Foundation.h` include order: `objc/objc.h`'s self-sufficient `#define
+   nil ((id)0)` vs. `CoreFoundation`'s `MacTypes.h` routing `NULL` through
+   an undefined `__DARWIN_NULL` — fixed by including `NSObjCRuntime.h`
+   (which pulls in `objc.h`) before `CoreFoundation.h` in the umbrella.
+2. ARC-compiled callers of the `NS_DURING` macro pulled in
+   `___objc_personality_v0`/`_Unwind_Resume` (no unwinder exists in this
+   tree) unless `NSHandler2`'s `exception` field carries
+   `__unsafe_unretained` — added.
+3. `libc`'s `strtod` was a hard stub returning 0.0 — replaced with a real
+   sign/integer/fraction/exponent parser (`userland/libc/src/
+   stdlib_misc.c`); `strtof`/`strtold` now thin wrappers over it.
+4. A cross-image `const NSString *const X` global, written through from a
+   constructor, read back stale/NULL from a *different* final executable
+   linking the same dylib — fixed by dropping `const` on
+   `NSGenericException`/`NSInvalidArgumentException`/etc.,
+   `NSCocoaErrorDomain`/etc., and `NSDefaultRunLoopMode`, in both
+   definition and header declaration.
+5. CF's `kCFType*CallBacks` (used by `kCFTypeArrayCallBacks` etc.) call
+   `CFRetain`/`CFRelease`/`CFEqual`/`CFHash`, which assume
+   `CFRuntimeBase` layout — invalid for a plain (non-bridged) Objective-C
+   object like an `NSNotificationCenter` observer. Silent hard crash
+   (zero output) the first time a plain-object collection was exercised.
+   Fixed with new `kNSObjectArrayCallBacks`/`kNSObjectDictionaryKey/
+   ValueCallBacks`/`kNSObjectSetCallBacks` (`NSCFBridge.c`) built on
+   `objc_msgSend`-based `-retain`/`-release`/`-isEqual:`/`-hash`/
+   `-description`/`-copy` instead.
+6. `NSPropertyListSerialization`'s XML parser never advanced past the
+   `<plist version="1.0">` opening tag's own closing `>` before handing
+   off to the value parser — every real plist failed to parse. Fixed by
+   `strchr`-ing past it first.
+7. `libc`'s `vsnprintf` has zero float support (pre-existing, documented
+   Phase 17 gap) — `%.17g`-based double formatting in
+   `NSPropertyListSerialization`/`NSJSONSerialization` silently corrupted
+   output and desynced later varargs. Fixed with
+   `NSCFBridge_formatDouble` (integer + manual fractional-digit
+   extraction, `%llu`/`%s` only, no float conversions).
+
+**Known v1 limitations (documented, not oversights):**
+- No `@"literal"` NSString constants — real compile-time NSString
+  literals need `___CFConstantStringClassReference`, a memory-overlay ABI
+  trick (the compiler emits a static struct whose `isa` *is* that
+  symbol's address, and real CF overlays a live `class_t`'s fields onto
+  it at startup) judged too fragile to replicate this phase. Use
+  `[NSString stringWithUTF8String:...]`.
+- No modern `@try`/`@catch`/`@throw` — needs a zero-cost DWARF unwinder
+  this tree doesn't have (confirmed empirically: this host clang has no
+  `-fobjc-sjlj-exceptions` fallback for x86_64). `NSException` +
+  `NS_DURING`/`NS_HANDLER`/`NS_ENDHANDLER` (genuine historical Foundation
+  API, setjmp/longjmp-based) is the real, working exception mechanism
+  instead.
+- `CFTimeZone` is UTC-only, `CFLocale` is en_US_POSIX-only, `CFURL` is
+  filesystem (`file://`) paths only — this tree has no tzdata or locale
+  data to back anything richer.
+- `NSBundle` main-bundle resolution is by path only — no `.bundle`/
+  Info.plist package structure.
+- `NSRunLoop` is single-mode, `poll()`-backed, no ports/observers/nested
+  run loops.
+- `NSKeyedArchiver`/`NSKeyedUnarchiver` round-trip plist-primitive object
+  graphs and simple `NSCoding` classes via the real XML-plist format
+  (`NSPropertyListXMLFormat_v1_0` is a genuine historical
+  NSKeyedArchiver wire format) — no cycle detection, no class-name
+  remapping.
+- `NSPropertyListSerialization` only writes/reads
+  `NSPropertyListXMLFormat_v1_0`; `NSPropertyListBinaryFormat_v1_0` isn't
+  implemented.
+
+**Three real fat16lite kernel bugs, none Foundation's to fix, all caught
+live chasing `NSUserDefaults`'s disk-backed persistence (full account in
+`userland/Foundation/include/Foundation/NSUserDefaults.h`):**
+1. `VNOP_CREATE` for a new file only succeeds when the parent directory
+   is a direct child of the volume root — one level deeper (e.g.
+   `/var/preferences/x.plist`) fails fast with `ENOTSUP` every time,
+   confirmed against both an mtools-built and a freshly `mkdir()`'d
+   parent. This is why `NSUserDefaults` is backed by `/tmp/<domain>.
+   plist`, not the more natural `/var/preferences/<domain>.plist`.
+2. `fat16lite_fsnode_vnode()` (`fat16lite_fsnode.c`) caches a vnode per
+   directory-entry slot (keyed by on-disk byte offset) and reuses it on a
+   later create at the same slot without rechecking its `v_type` —
+   `rmdir()`/`unlink()` free a slot but deliberately don't evict this
+   cache (a real prior fix; see that function's own comment, made
+   removal not clobber an unrelated live vnode's cluster pointers). A
+   directory removed and then immediately followed, at the *same freed
+   slot*, by a *file* created there comes back from `open()` as
+   `EISDIR`. `test/foundationtest.m`'s NSFileManager test creates its
+   temp directory before its temp file specifically to avoid handing a
+   later `-synchronize` a freed directory-flavored slot (see that test's
+   own comment).
+3. Calling `-synchronize` for real from the automated test suite made
+   that process's `write()` hang indefinitely — not fail, hang — and
+   while hung it silently starved `pthreadtest`'s own unrelated KeepAlive
+   respawns too. Not root-caused (bugs #1 and #2 above were each found by
+   full source-level analysis of `fat16lite_vnops.c`/
+   `fat16lite_fsnode.c`; this one wasn't chased that far). `-synchronize`
+   itself is a real, unstubbed implementation
+   (`NSPropertyListSerialization` + `NSData -writeToFile:atomically:`,
+   both genuine); `test_nsuserdefaults()` exercises the real in-memory
+   accessors (`-setInteger:`/`-setObject:`/`-setBool:`/`-integerForKey:`/
+   etc., all genuinely `CFMutableDictionary`-backed) but does not call
+   `-synchronize`, given #3.
+
+**A fourth, separate, genuinely new finding — not a Foundation bug, a
+scheduling-fairness gap between concurrent KeepAlive daemons:**
+`foundationtest`'s own full run (all classes above, including several
+real disk operations) reliably reaches and prints `FOUNDATIONTEST PASS`
+repeatedly across many respawns when run **alone** (`cftest`/
+`pthreadtest` daemons temporarily removed from `/etc/launchd/daemons` for
+this isolation test, `libCoreFoundation.dylib`/binaries left in place).
+With `cftest`'s very tight, low-latency KeepAlive respawn loop also
+running, `foundationtest` was observed to receive essentially no CPU/
+scheduling time for 2+ minutes straight (no `FOUNDATIONTEST` output at
+all, PASS or FAIL) while `cftest`/`pthreadtest` continued passing
+normally — i.e., adding Foundation's daemon causes zero regression to
+either pre-existing daemon, but a heavier, slower daemon can itself be
+starved by a much lighter, faster one sharing the same KeepAlive
+respawn/scheduling path. A real, previously-latent launchd/kernel
+scheduling-fairness issue, only exposed now because Foundation is the
+first daemon in this tree slow/heavy enough to reveal it. Not chased into
+the kernel scheduler this phase — same "document, don't chase" precedent
+as the Phase 4 boot-thread-stall entry and the three fat16lite bugs
+above.
+
+**Verified live in QEMU:** `userland/Foundation/test/foundationtest.m`
+(real `.m` source, host clang, `-fobjc-arc`, same discipline as
+`objctest`/`cftest`) exercises `NSString`↔`CFString` bridging (including
+a direct toll-free retain-count-identity check across the CF/NS
+boundary), `NSArray`/`NSDictionary`/`NSSet` mutation, `NSData`,
+`NSException` catch/rethrow (including nested `NS_DURING`), `NSError`,
+`NSDate`/`NSTimeZone`/`NSLocale`/`NSURL`, `NSFileManager` real
+create/list/remove against the FAT16 root, `NSBundle`, `NSProcessInfo`
+(including real launchd-provided `EnvironmentVariables`),
+`NSNotificationCenter`, `NSRunLoop`/`NSTimer`, `NSJSONSerialization` and
+`NSPropertyListSerialization` round-trips, `NSKeyedArchiver`/
+`NSKeyedUnarchiver` (plist-primitive graph and a custom `NSCoding`
+class), `NSUserDefaults`'s in-memory accessors, and `@autoreleasepool`.
+Installed as a `KeepAlive` launchd daemon
+(`com.asteros.foundationtest.plist`) and confirmed, run in isolation, via
+repeated QEMU monitor `screendump` captures showing `FOUNDATIONTEST PASS`
+on every respawn from a from-scratch `libFoundation.dylib` +
+`foundationtest` + image rebuild; `cftest`/`pthreadtest` independently
+reconfirmed passing with Foundation's dylib and daemon present in the
+full system (no regression), per the scheduling-fairness caveat above.
+
 ## Known deviations from a literal reading of the task (documented, not oversights)
 - ~~BusyBox → our own tiny multicall static binary~~ — superseded, see Phase 9 above.
 - ~~Root filesystem → MOCKFS + RAMDisk~~ — superseded: the actual root filesystem is

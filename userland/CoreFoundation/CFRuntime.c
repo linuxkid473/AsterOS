@@ -6,6 +6,7 @@
 #include <pthread.h>
 
 static const CFRuntimeClass *g_classes[CF_MAX_RUNTIME_CLASSES];
+static void *g_bridgeClasses[CF_MAX_RUNTIME_CLASSES];	/* parallel to g_classes, indexed the same way; NULL = not bridged */
 static CFIndex g_classCount;
 static pthread_mutex_t g_classLock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -25,12 +26,34 @@ const CFRuntimeClass *_CFRuntimeGetClass(CFTypeID typeID)
 	return g_classes[typeID - 1];
 }
 
+void _CFRuntimeBridgeClasses(CFTypeID typeID, void *isaClass)
+{
+	if (typeID == 0 || typeID > (CFTypeID)g_classCount)
+		return;
+	pthread_mutex_lock(&g_classLock);
+	g_bridgeClasses[typeID - 1] = isaClass;
+	pthread_mutex_unlock(&g_classLock);
+}
+
+void *_CFRuntimeGetBridgedClass(CFTypeID typeID)
+{
+	if (typeID == 0 || typeID > (CFTypeID)g_classCount)
+		return NULL;
+	return g_bridgeClasses[typeID - 1];
+}
+
+void _CFRuntimeSetInstanceISA(CFTypeRef cf, void *isaClass)
+{
+	((CFRuntimeBase *)cf)->isa = isaClass;
+}
+
 CFTypeRef _CFRuntimeCreateInstance(CFAllocatorRef allocator, CFTypeID typeID, CFIndex extraBytes)
 {
 	(void)allocator;	/* v1: every allocator is malloc-backed, see CFAllocator.c */
 	CFRuntimeBase *base = calloc(1, sizeof(CFRuntimeBase) + (size_t)extraBytes);
 	if (!base)
 		return NULL;
+	base->isa = _CFRuntimeGetBridgedClass(typeID);
 	base->typeID = typeID;
 	base->isConstant = false;
 	base->retainCount = 1;
@@ -40,6 +63,7 @@ CFTypeRef _CFRuntimeCreateInstance(CFAllocatorRef allocator, CFTypeID typeID, CF
 void _CFRuntimeInitStaticInstance(void *memory, CFTypeID typeID)
 {
 	CFRuntimeBase *base = memory;
+	base->isa = _CFRuntimeGetBridgedClass(typeID);
 	base->typeID = typeID;
 	base->isConstant = true;
 	base->retainCount = 1;

@@ -15,6 +15,15 @@ char **environ; /* the one authoritative definition -- see unistd.h */
  * tracking. */
 const char *__libc_argv0;
 
+/* Full argc/argv, added for NSProcessInfo (userland/Foundation) --
+ * same reasoning as __libc_argv0 just above: real storage lives here
+ * (shared, libSystem.dylib-resident) so both static and dynamically
+ * linked executables can see it via extern, assigned from
+ * __libc_start() in libc_start.c, which alone has the real values off
+ * the initial stack. */
+int __libc_argc;
+char **__libc_argv;
+
 #define MAX_ATEXIT 32
 static void (*g_atexit_fns[MAX_ATEXIT])(void);
 static int g_atexit_count;

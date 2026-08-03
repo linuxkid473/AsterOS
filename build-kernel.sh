@@ -58,6 +58,18 @@ if [ ! -f "$SDKROOT/usr/local/include/os/internal/internal_shared.h" ]; then
 fi
 
 # --- Step 4: xnu installhdrs (needed before libfirehose_kernel) ---
+# Guarded by HDRS_STAMP (see Step 7 below): installhdrs/the Step 6 cp -f/
+# exporthdrs all unconditionally rewrite header files every invocation,
+# which was bumping their mtimes on every `make run` even when nothing
+# under src/xnu actually changed -- xnu's own kernel make then saw those
+# headers as "newer" and recompiled the handful of .c files that include
+# them (log.c, OSKext.cpp, subr_log.c), which cascaded into a full
+# relink/restrip/CTF pass and, via build-kernel.sh's own cmp-before-cp
+# below, an unnecessary downstream image rebuild too. Skipping this block
+# once it's already run once is safe: these are xnu's own exported
+# headers, not something this project's own source changes affect.
+HDRS_STAMP="$ROOT/build/kernel/.hdrs-stamp"
+if [ ! -f "$HDRS_STAMP" ]; then
 log "xnu installhdrs"
 (cd "$SRC/xnu" && make SDKROOT="$SDKROOT" ARCH_CONFIGS=X86_64 XCRUN="$XCRUN_WRAPPER" installhdrs)
 
@@ -89,6 +101,10 @@ cp -f "$SRC/libdispatch/os/firehose_buffer_private.h" "$SRC/libdispatch/os/fireh
 log "xnu exporthdrs"
 mkdir -p "$SRC/xnu/BUILD/obj/EXPORT_HDRS/libsa"
 (cd "$SRC/xnu" && make SDKROOT="$SDKROOT" ARCH_CONFIGS=X86_64 KERNEL_CONFIGS=DEVELOPMENT XCRUN="$XCRUN_WRAPPER" exporthdrs)
+touch "$HDRS_STAMP"
+else
+	log "xnu installhdrs/exporthdrs already run once -- skipping (rm $HDRS_STAMP to force)"
+fi
 
 # --- Step 8: the kernel itself ---
 # SLIDE=0x10 (see makedefs/MakeInc.def: KERNEL_STATIC_SLIDE = SLIDE << 21)
@@ -106,6 +122,15 @@ log "Building the kernel (this is the long step)"
 (cd "$SRC/xnu" && make SDKROOT="$SDKROOT" ARCH_CONFIGS=X86_64 KERNEL_CONFIGS=DEVELOPMENT XCRUN="$XCRUN_WRAPPER" SLIDE=0x10 -j"$(sysctl -n hw.ncpu)")
 
 mkdir -p "$ROOT/build/kernel"
-cp "$SRC/xnu/BUILD/obj/DEVELOPMENT_X86_64/kernel.development" "$ROOT/build/kernel/"
+# cmp-before-cp: xnu's own make above is already a fast no-op when nothing
+# under src/xnu changed, but an unconditional cp here would still bump
+# kernel.development's mtime on every invocation regardless -- and the
+# top-level Makefile's $(ESP_IMG) rule depends on that file's mtime to
+# decide whether `make run` needs to redo the (expensive, always-from-
+# scratch, see mkrootfs.sh's header comment) image assembly. Only touch
+# the destination when the built kernel actually differs.
+if ! cmp -s "$SRC/xnu/BUILD/obj/DEVELOPMENT_X86_64/kernel.development" "$ROOT/build/kernel/kernel.development" 2>/dev/null; then
+	cp "$SRC/xnu/BUILD/obj/DEVELOPMENT_X86_64/kernel.development" "$ROOT/build/kernel/"
+fi
 log "Done: build/kernel/kernel.development"
 file "$ROOT/build/kernel/kernel.development"

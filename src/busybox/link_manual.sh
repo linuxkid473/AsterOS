@@ -58,7 +58,19 @@ BB_OBJS=(
 )
 
 "$CLANG" -target x86_64-apple-macos10.15 -nostdlib -static -e _start \
-	"${LIBC_OBJS[@]}" "${BB_OBJS[@]}" -o busybox_unstripped
+	"${LIBC_OBJS[@]}" "${BB_OBJS[@]}" -o busybox_unstripped.new
+
+# cmp-before-mv, same reason as build-kernel.sh's kernel.development copy:
+# the objects above are already incrementally rebuilt by busybox's own
+# Kbuild, but this final link step re-runs unconditionally -- only replace
+# the real output (and its mtime) when the link result actually changed,
+# so the top-level Makefile's $(ROOTFS_IMG) rule can skip the (expensive,
+# always-from-scratch) image assembly when nothing did.
+if ! cmp -s busybox_unstripped.new busybox_unstripped 2>/dev/null; then
+	mv busybox_unstripped.new busybox_unstripped
+else
+	rm -f busybox_unstripped.new
+fi
 
 echo "linked: busybox_unstripped"
 file busybox_unstripped

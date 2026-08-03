@@ -92,6 +92,56 @@ TSD). Full account, including the pre-existing libc `vsnprintf`
 floating-point gap `CFStringCreateWithFormat` surfaced, in `TODO.md`
 Phase 17.
 
+## Decision: Foundation scope (see TODO.md Phase 18)
+`userland/Foundation/` is real Objective-C wrapping CoreFoundation via
+toll-free bridging — `CFRuntimeBase` now starts with a literal `void
+*isa` matching libobjc's `struct objc_object`, and a new CF entry point
+(`_CFRuntimeBridgeClasses`) lets Foundation register, at load time, which
+Objective-C class backs each bridged `CFTypeID`. A bridged `NSCFFoo`
+(e.g. `NSCFString`) forwards `-retain`/`-release`/`-isEqual:`/`-hash`/
+`-description` straight into the matching `CFRetain`/`CFRelease`/
+`CFEqual`/`CFHash`/`CFCopyDescription` call — retain counts and equality
+are identical whether an object is touched through CF or NS API, the
+actual meaning of "toll-free." `NSMutableFoo` shares its bridged
+counterpart's backing struct rather than needing a separate subclass,
+since this tree's CF already treats `CFFooRef`/`CFMutableFooRef` as
+`const`/non-`const` views of one struct.
+
+Exceptions are the one place this phase didn't chase full Apple
+compatibility: modern `@try`/`@catch`/`@throw` needs a zero-cost DWARF
+unwinder this tree doesn't have (confirmed empirically — this host clang
+has no `-fobjc-sjlj-exceptions` fallback for x86_64). `NSException` ships
+real, working `NS_DURING`/`NS_HANDLER`/`NS_ENDHANDLER` macros instead — a
+genuine historical Foundation mechanism (setjmp/longjmp-based), not an
+approximation invented for this project.
+
+Getting `NSUserDefaults`'s disk-backed persistence working live in QEMU
+surfaced three separate, real bugs in `fat16lite` (this tree's from-
+scratch FAT16 kernel driver), none of them Foundation's to fix: `VNOP_
+CREATE` only succeeds one level below the volume root (deeper paths fail
+fast with `ENOTSUP`); `fat16lite_fsnode_vnode()` caches a vnode per
+directory-entry slot and can hand back a stale, wrong-`v_type` vnode
+(`EISDIR`) when a slot a directory just vacated is immediately reused for
+a file; and calling the real disk-write path from an automated,
+always-respawning test daemon reproducibly hung the whole process (and,
+while hung, silently starved an unrelated daemon's own KeepAlive
+respawns too) for a reason not root-caused this phase. Full account,
+including the exact call sites and workarounds, in `TODO.md` Phase 18 and
+`userland/Foundation/include/Foundation/NSUserDefaults.h`'s header
+comment — consistent with this tree's standing precedent (Phase 4's
+boot-thread-stall entry) of documenting a live-caught kernel-level issue
+rather than chasing it into territory a given phase doesn't own.
+
+A fourth finding is not a Foundation bug at all: a very tight, low-
+latency KeepAlive respawn loop (`cftest`) can starve a slower, heavier
+co-resident KeepAlive daemon (`foundationtest`) of scheduling time almost
+entirely — `foundationtest` reliably passes repeatedly across many
+respawns when run alone, and adding it to the system causes zero
+regression to `cftest`/`pthreadtest`, but the three daemons together
+exposed a real, previously-latent launchd/kernel scheduling-fairness gap
+that only a slow-enough daemon could reveal. Also documented rather than
+chased this phase.
+
 ## Decision: root filesystem = MOCKFS + in-memory RAMDisk (no disk driver at all)
 Investigated three options:
 1. **Real disk (AHCI/NVMe) + HFS+.** Apple's AHCI/NVMe storage kexts are NOT open source; ravynOS had to write their own AHCI driver from scratch (~6 months of effort) to get this far. HFS+ itself is also a separate kext, not statically linkable without patches. Rejected — out of scope for "smallest possible" system, and user explicitly said to skip this (no AHCI).

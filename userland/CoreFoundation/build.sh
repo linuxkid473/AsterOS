@@ -24,7 +24,7 @@ CFLAGS=(-target x86_64-apple-macos10.15 -ffreestanding -fno-stack-protector
         -O1 -g -Wall -Wextra -Wno-unused-parameter -std=gnu11)
 
 OBJS=()
-for f in CFRuntime CFAllocator CFNull CFBoolean CFString CFArray CFDictionary CFSet CFNumber CFData; do
+for f in CFRuntime CFAllocator CFNull CFBoolean CFString CFArray CFDictionary CFSet CFNumber CFData CFDate CFTimeZone CFLocale CFURL; do
 	"$CLANG" "${CFLAGS[@]}" -c "$f.c" -o "$OUT/$f.o"
 	OBJS+=("$OUT/$f.o")
 done

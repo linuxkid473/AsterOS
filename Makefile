@@ -24,7 +24,7 @@ LAUNCHD_BIN := build/launchd/launchd
 TOOLCHAIN_CLANG := build/llvm-static-build/bin/clang
 TOOLCHAIN_LD    := build/ld64_bin/ld64
 
-.PHONY: all kernel bootloader libc busybox neatvi launchd toolchain image run clean help
+.PHONY: all kernel bootloader libc busybox neatvi launchd toolchain image run clean help kernel-build busybox-build
 
 all: image
 
@@ -32,11 +32,19 @@ help:
 	@echo "targets: all, kernel, bootloader, libc, busybox, neatvi, launchd, toolchain, image, run, clean"
 
 # --- kernel -----------------------------------------------------------
-# Always delegates to build-kernel.sh, which itself calls into xnu's own
-# incremental `make` -- fast (a no-op check) when nothing under src/xnu
-# changed, so there's no need to duplicate that staleness tracking here.
-kernel:
+# `kernel-build` always delegates to build-kernel.sh, which itself calls
+# into xnu's own incremental `make` -- fast (a no-op check) when nothing
+# under src/xnu changed -- and only touches $(KERNEL_BIN)'s mtime when
+# the resulting kernel.development actually differs (see build-kernel.sh's
+# cmp-before-cp). $(KERNEL_BIN)'s own recipe is a no-op: it exists purely
+# so downstream targets (like $(ESP_IMG)) depend on this file's *real*
+# mtime rather than on the always-stale phony `kernel-build`, so `make
+# run` doesn't reassemble the image when nothing actually changed.
+kernel: $(KERNEL_BIN)
+kernel-build:
 	./build-kernel.sh
+$(KERNEL_BIN): kernel-build
+	@:
 
 # --- bootloader ---------------------------------------------------------
 bootloader: $(BOOTX64)
@@ -51,14 +59,22 @@ $(LIBC_STAMP): $(wildcard userland/libc/src/*.c userland/libc/src/*.S userland/l
 	touch $@
 
 # --- busybox --------------------------------------------------------------
-# Always delegates to busybox's own Kbuild, which is genuinely incremental
-# (only recompiles changed .c files) -- fast when nothing changed. Its own
-# trylink-based final link doesn't know about our custom libc object set
-# (see link_manual.sh), so that last step is expected to fail; everything
-# before it (every lib.a/built-in.o) still builds, which is all
-# link_manual.sh actually needs, and that final link itself is a single
-# fast clang invocation regardless.
-busybox: $(LIBC_STAMP)
+# Real prerequisites, not an always-rerun phony (unlike kernel/busybox's
+# own two-level split above): busybox's final static link turned out to be
+# non-deterministic byte-for-byte (relinking identical, unchanged .o/.a
+# inputs still produces a different binary each time -- almost certainly
+# ar/ld embedding something like a timestamp), so a cmp-before-replace
+# guard inside link_manual.sh can't tell "really changed" from "just
+# relinked" the way build-kernel.sh's kernel.development one can. Gating
+# on real file mtimes here instead means busybox only rebuilds when this
+# project's own libc actually changes (busybox is vendored, upstream
+# source this project doesn't edit) -- `make busybox-build` still forces
+# a manual relink if ever needed.
+busybox: $(BUSYBOX_BIN)
+busybox-build:
+	$(MAKE) -C src/busybox CC="$(TOOLS_BIN)/cc-nogroup" AR="$(TOOLS_BIN)/ar" -j$(NPROC) || true
+	cd src/busybox && ROOT="$(ROOT)" bash link_manual.sh
+$(BUSYBOX_BIN): $(LIBC_STAMP)
 	$(MAKE) -C src/busybox CC="$(TOOLS_BIN)/cc-nogroup" AR="$(TOOLS_BIN)/ar" -j$(NPROC) || true
 	cd src/busybox && ROOT="$(ROOT)" bash link_manual.sh
 
@@ -97,12 +113,18 @@ toolchain:
 	fi
 
 # --- disk images ------------------------------------------------------
+# Both rules below depend on real output files ($(BUSYBOX_BIN),
+# $(KERNEL_BIN), etc.), not the phony `busybox`/`kernel` target names --
+# mkrootfs.sh/mkesp.sh always rebuild their image from scratch when
+# invoked (see mkrootfs.sh's header comment on why: repeated in-place
+# mcopy fragments the FAT cluster chain), so `make run` only re-invokes
+# them when a prerequisite's mtime genuinely changed, not on every run.
 image: $(ESP_IMG)
 
-$(ROOTFS_IMG): busybox $(NEATVI_BIN) $(LAUNCHD_BIN)
+$(ROOTFS_IMG): $(BUSYBOX_BIN) $(NEATVI_BIN) $(LAUNCHD_BIN)
 	bash userland/mkrootfs.sh
 
-$(ESP_IMG): $(BOOTX64) kernel $(ROOTFS_IMG)
+$(ESP_IMG): $(BOOTX64) $(KERNEL_BIN) $(ROOTFS_IMG)
 	bash boot/mkesp.sh
 
 # --- run ----------------------------------------------------------------
