@@ -33,6 +33,17 @@ done
 mmd -i "$ROOTFS_IMG" ::/usr/lib
 mmd -i "$ROOTFS_IMG" ::/var/log
 
+# xnu's vm_swap_create_file() hardcodes SWAP_FILE_NAME as
+# "/private/var/vm/swapfile" (osfmk/vm/vm_compressor_backing_store.h) --
+# without this directory the compressor's swapfile-create thread just
+# fails forever (harmlessly, but noisily: "vm_swap_create_file failed").
+# Created directly at this literal path rather than as a /var symlink
+# target -- fat16lite has no symlink support, and nothing else here reads
+# swap files via /var/vm, so there's no need for the two paths to alias.
+mmd -i "$ROOTFS_IMG" ::/private
+mmd -i "$ROOTFS_IMG" ::/private/var
+mmd -i "$ROOTFS_IMG" ::/private/var/vm
+
 mcopy -i "$ROOTFS_IMG" src/busybox/busybox_unstripped ::/bin/busybox
 mcopy -i "$ROOTFS_IMG" build/launchd/launchd ::/sbin/launchd
 
@@ -120,6 +131,33 @@ if [ -x "$CLANG_BIN" ] && [ -x "$LD_BIN" ] && [ -f "$LIBCXX" ] && [ -f "$LIBCXXA
 	mmd -i "$ROOTFS_IMG" ::/usr/lib/clang
 	mmd -i "$ROOTFS_IMG" ::/usr/lib/clang/20
 	mcopy -s -i "$ROOTFS_IMG" "$CLANG_RESOURCE_INCLUDE" ::/usr/lib/clang/20/
+
+	# CoreFoundation/Foundation SDK headers: flat, not real .framework
+	# bundles (see userland/Foundation/build.sh) -- so no -F search path
+	# is needed, just landing them under /usr/include like libc's own
+	# headers above, which clang.cfg already -isystem's unconditionally.
+	# This is genuinely the missing piece: without it clang -v only ever
+	# searches /usr/include and the clang resource dir, and #import
+	# <Foundation/Foundation.h> fails with "file not found" even though
+	# libFoundation.dylib itself is already on disk at /usr/lib.
+	mcopy -s -i "$ROOTFS_IMG" userland/CoreFoundation/include/CoreFoundation ::/usr/include/
+	mcopy -s -i "$ROOTFS_IMG" userland/Foundation/include/Foundation ::/usr/include/
+
+	# crt0.o/libc_start.o as standalone objects, not just archived into
+	# libc.a: a dynamically-linked executable (Foundation/CoreFoundation/
+	# objc/System dylibs) still needs these two linked in directly by path
+	# to get from _start into main -- same recipe as Foundation/test/
+	# build.sh's CRT0/LIBC_START, just with the on-target ld in place of
+	# the host's.
+	mcopy -i "$ROOTFS_IMG" build/libc_obj/crt0.o ::/usr/lib/crt0.o
+	mcopy -i "$ROOTFS_IMG" build/libc_obj/libc_start.o ::/usr/lib/libc_start.o
+
+	# SDK smoke test: a real .m source file plus the exact clang/ld
+	# invocation needed to compile+link it against the just-installed
+	# headers/dylibs, run from the guest shell (`sh /tmp/build-hello.sh`)
+	# to prove the whole chain end to end, not just that headers parse.
+	mcopy -i "$ROOTFS_IMG" userland/Foundation/examples/hello.m ::/tmp/hello.m
+	mcopy -i "$ROOTFS_IMG" userland/toolchain/build-hello.sh ::/tmp/build-hello.sh
 else
 	echo "no prebuilt native toolchain in build/ -- deploying core rootfs only"
 	mcopy -i "$ROOTFS_IMG" build/neatvi_obj/neatvi ::/bin/neatvi

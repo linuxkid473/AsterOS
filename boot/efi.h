@@ -37,6 +37,7 @@ typedef uint64_t EFI_VIRTUAL_ADDRESS;
 #define EFI_ERROR(x) (((INTN)(x)) < 0)
 #define EFI_LOAD_ERROR (EFI_ERROR_BIT | 1)
 #define EFI_INVALID_PARAMETER (EFI_ERROR_BIT | 2)
+#define EFI_NOT_READY (EFI_ERROR_BIT | 6)
 #define EFI_NOT_FOUND (EFI_ERROR_BIT | 14)
 #define EFI_BUFFER_TOO_SMALL (EFI_ERROR_BIT | 5)
 
@@ -59,17 +60,45 @@ typedef struct {
 typedef struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL;
 typedef EFI_STATUS (EFIAPI *EFI_TEXT_STRING)(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String);
 typedef EFI_STATUS (EFIAPI *EFI_TEXT_RESET)(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, BOOLEAN ExtendedVerification);
+typedef EFI_STATUS (EFIAPI *EFI_TEXT_QUERY_MODE)(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN ModeNumber, UINTN *Columns, UINTN *Rows);
+typedef EFI_STATUS (EFIAPI *EFI_TEXT_SET_CURSOR_POSITION)(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN Column, UINTN Row);
+typedef EFI_STATUS (EFIAPI *EFI_TEXT_CLEAR_SCREEN)(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This);
+
+typedef struct {
+	int32_t MaxMode;
+	int32_t Mode;
+	int32_t Attribute;
+	int32_t CursorColumn;
+	int32_t CursorRow;
+	BOOLEAN CursorVisible;
+} EFI_SIMPLE_TEXT_OUTPUT_MODE;
+
 struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL {
 	EFI_TEXT_RESET Reset;
 	EFI_TEXT_STRING OutputString;
 	void *TestString;
-	void *QueryMode;
+	EFI_TEXT_QUERY_MODE QueryMode;
 	void *SetMode;
 	void *SetAttribute;
-	void *ClearScreen;
-	void *SetCursorPosition;
+	EFI_TEXT_CLEAR_SCREEN ClearScreen;
+	EFI_TEXT_SET_CURSOR_POSITION SetCursorPosition;
 	void *EnableCursor;
-	void *Mode;
+	EFI_SIMPLE_TEXT_OUTPUT_MODE *Mode;
+};
+
+/* ---- Simple Text Input ---- */
+typedef struct {
+	uint16_t ScanCode;
+	CHAR16 UnicodeChar;
+} EFI_INPUT_KEY;
+
+typedef struct _EFI_SIMPLE_TEXT_INPUT_PROTOCOL EFI_SIMPLE_TEXT_INPUT_PROTOCOL;
+typedef EFI_STATUS (EFIAPI *EFI_INPUT_RESET)(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, BOOLEAN ExtendedVerification);
+typedef EFI_STATUS (EFIAPI *EFI_INPUT_READ_KEY)(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, EFI_INPUT_KEY *Key);
+struct _EFI_SIMPLE_TEXT_INPUT_PROTOCOL {
+	EFI_INPUT_RESET Reset;
+	EFI_INPUT_READ_KEY ReadKeyStroke;
+	EFI_EVENT WaitForKey;
 };
 
 /* ---- Memory map / AllocatePages ---- */
@@ -226,7 +255,7 @@ typedef struct {
 	CHAR16 *FirmwareVendor;
 	uint32_t FirmwareRevision;
 	EFI_HANDLE ConsoleInHandle;
-	void *ConIn;
+	EFI_SIMPLE_TEXT_INPUT_PROTOCOL *ConIn;
 	EFI_HANDLE ConsoleOutHandle;
 	EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *ConOut;
 	EFI_HANDLE StandardErrorHandle;

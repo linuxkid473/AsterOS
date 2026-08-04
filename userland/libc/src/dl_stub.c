@@ -42,6 +42,7 @@ host_statistics(host_t host_priv, host_flavor_t flavor, host_info_t host_info_ou
 
 #include <sys/sysctl.h>
 #include <string.h>
+#include "syscall_raw.h"
 
 int
 sysctl(int *name, unsigned int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen)
@@ -72,12 +73,19 @@ sysctl(int *name, unsigned int namelen, void *oldp, size_t *oldlenp, void *newp,
 	return -1;
 }
 
+/* Unlike sysctl() above (still a hand-picked-OID stub -- fine for its
+ * only two real callers), sysctlbyname() has an actual dedicated kernel
+ * syscall (sys_sysctlbyname, 274 -- bsd/kern/kern_newsysctl.c) that takes
+ * the name string directly, no userland OID resolution needed. Wired to
+ * the real syscall (not a canned answer) because AsterOS's own
+ * kern.consoletext sysctl (bsd/kern/kern_sysctl.c) needs a real
+ * round-trip: userland/launchd writes to it right before starting the
+ * shell daemon, to reveal the console over a quiet-boot splash. */
 int
 sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen)
 {
-	(void)name; (void)oldp; (void)oldlenp; (void)newp; (void)newlen;
-	errno = ENOTSUP;
-	return -1;
+	return (int)sys_result(raw_syscall6(SYS_sysctlbyname, (long)name, (long)strlen(name),
+	    (long)oldp, (long)oldlenp, (long)newp, (long)newlen));
 }
 kern_return_t
 task_get_exception_ports(mach_port_t task, exception_mask_t exception_mask,

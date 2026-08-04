@@ -55,6 +55,8 @@
 #define SYS_mmap          197
 #define SYS_lseek         199
 #define SYS_ftruncate     201
+#define SYS_sysctl        202
+#define SYS_sysctlbyname  274
 #define SYS_getrusage     117
 #define SYS_gettimeofday  116
 #define SYS_getdirentries64 344

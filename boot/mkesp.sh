@@ -20,5 +20,11 @@ mcopy -i "$ESP_IMG" boot/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
 mcopy -i "$ESP_IMG" "$KERNEL_BIN" ::/mach_kernel
 mcopy -i "$ESP_IMG" boot/fat16.img ::/fat16.img
 
+# Quiet-boot splash (see boot/gen_splash.py) -- optional: boot.c falls back
+# to the plain text console if this isn't present.
+if [ -f boot/splash.raw ]; then
+	mcopy -i "$ESP_IMG" boot/splash.raw ::/splash.raw
+fi
+
 echo "ESP assembled: $ESP_IMG"
 mdir -i "$ESP_IMG" ::

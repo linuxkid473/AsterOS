@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <time.h>
+#include <sys/sysctl.h>
 #include "plist.h"
 
 #define MAX_DAEMONS      64
@@ -279,11 +280,34 @@ spawn_daemon(struct daemon *d)
 	llog(d->cfg.label, "started pid %d", pid);
 }
 
+/* Quiet boot (see boot/boot.c) hides the console behind a splash by
+ * telling xnu to use KBOOT_GRAPHICS_MODE, which -- unlike real macOS,
+ * which has a WindowServer/loginwindow to paint over the boot picture
+ * once it's ready -- this kernel never undoes on its own. kern.consoletext
+ * (bsd/kern/kern_sysctl.c) is the escape hatch: writing any nonzero value
+ * calls initialize_screen(NULL, kPETextScreen) and reveals the text
+ * console. Called right before starting com.asteros.shell specifically
+ * (not e.g. after load_all_daemons()) so the splash stays up for exactly
+ * as long as the boot-time test daemons (cftest/pthreadtest/
+ * foundationtest/echotest) are still doing their thing, and disappears
+ * right as the interactive shell is about to become visible. A failed
+ * write (e.g. verbose boot, where the console was never hidden to begin
+ * with) is harmless -- ignored. */
+static void
+reveal_console(void)
+{
+	int one = 1;
+	sysctlbyname("kern.consoletext", NULL, NULL, &one, sizeof(one));
+}
+
 static void
 start_runatload_daemons(void)
 {
 	for (int i = 0; i < g_ndaemons; i++) {
 		if (g_daemons[i].cfg.run_at_load) {
+			if (strcmp(g_daemons[i].cfg.label, "com.asteros.shell") == 0) {
+				reveal_console();
+			}
 			spawn_daemon(&g_daemons[i]);
 		}
 	}

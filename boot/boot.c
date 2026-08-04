@@ -95,6 +95,39 @@ static UINTN strlen_(const char *s)
 	return n;
 }
 
+/* Whitespace-delimited exact-token search (mirrors how xnu's own
+ * PE_parse_boot_argn treats "-v": a whole space-separated word, not a
+ * substring match -- e.g. a boot-args string containing "vti=0" must NOT
+ * count as having "-v"). */
+static int cmdline_has_token(const char *cmdline, const char *token)
+{
+	UINTN tok_len = strlen_(token);
+	const char *p = cmdline;
+	while (*p) {
+		while (*p == ' ') {
+			p++;
+		}
+		if (!*p) {
+			break;
+		}
+		const char *start = p;
+		while (*p && *p != ' ') {
+			p++;
+		}
+		UINTN word_len = (UINTN)(p - start);
+		if (word_len == tok_len) {
+			UINTN i = 0;
+			while (i < tok_len && start[i] == token[i]) {
+				i++;
+			}
+			if (i == tok_len) {
+				return 1;
+			}
+		}
+	}
+	return 0;
+}
+
 /* Not cryptographically rigorous -- just needs to be non-trivial entropy
  * for xnu's early PRNG seed (see the device-tree "random-seed" comment
  * below); xnu's own bootseed_init_native mixes in RDSEED/RDRAND itself as
@@ -154,6 +187,7 @@ static uint8_t *dt_put_prop(uint8_t *cursor, const char *name, const void *value
 extern void jump_to_kernel(uint32_t entry_phys, uint32_t boot_args_phys) EFIAPI;
 
 #define KERNEL_PATH_U16 u"\\mach_kernel"
+#define SPLASH_PATH_U16 u"\\splash.raw"
 #define PAGE_SIZE 4096ULL
 
 static EFI_BOOT_SERVICES *gBS;
@@ -177,15 +211,22 @@ static UINTN pages_for(uint64_t size)
  * console (Apple logo + spinner, text hidden -- what osfmk/console/
  * video_console.c calls gc_graphics_boot, and what real boot.efi only uses
  * for a *non*-verbose boot); FB_TEXT_MODE(2) is the plain scrolling
- * character-grid console real boot.efi switches to for verbose (-v) boot,
- * which is what we want here since our cmdline is always "-v" and we want
- * kernel/BusyBox text visible, not hidden behind a splash screen. Confirmed
- * by reading initialize_screen()'s kPEAcquireScreen case: with v_display ==
- * GRAPHICS_MODE, gc_graphics_boot ends up TRUE, so gc_enable(!graphics_now)
- * resolves to gc_enable(FALSE) -- which explicitly sets disableConsoleOutput
- * = TRUE (console_is_serial() is FALSE for us) -- so printf/tty output never
- * reaches the screen at all. FB_TEXT_MODE avoids that branch entirely. */
+ * character-grid console real boot.efi switches to for verbose (-v) boot.
+ * Which one we pick is now driven by whether the interactive prompt's final
+ * command line has "-v" in it (see the KBOOT_GRAPHICS_MODE/show_splash logic
+ * in efi_main): verbose wants kernel/BusyBox text visible, not hidden behind
+ * the splash. Confirmed by reading initialize_screen()'s kPEAcquireScreen
+ * case: with v_display == GRAPHICS_MODE, gc_graphics_boot ends up TRUE, so
+ * gc_enable(!graphics_now) resolves to gc_enable(FALSE) -- which explicitly
+ * sets disableConsoleOutput = TRUE (console_is_serial() is FALSE for us) --
+ * so printf/tty output never reaches the screen at all. FB_TEXT_MODE avoids
+ * that branch entirely. */
 #define KBOOT_FB_TEXT_MODE 2
+/* The other side of that same branch: real boot.efi's non-verbose splash
+ * mode, used below (see load_and_blit_splash) when the interactive prompt
+ * wasn't given "-v" -- gc_graphics_boot ends up TRUE and text output stays
+ * suppressed so it doesn't scribble over the picture we already drew. */
+#define KBOOT_GRAPHICS_MODE 1
 
 typedef struct {
 	uint64_t base;
@@ -193,6 +234,7 @@ typedef struct {
 	uint32_t height;
 	uint32_t rowBytes;
 	int valid;
+	int bgr; /* 1 => PixelBlueGreenRedReserved8BitPerColor, 0 => RGB order */
 } gop_fb_t;
 
 static gop_fb_t locate_gop_framebuffer(void)
@@ -220,6 +262,7 @@ static gop_fb_t locate_gop_framebuffer(void)
 	fb.width = info->HorizontalResolution;
 	fb.height = info->VerticalResolution;
 	fb.rowBytes = info->PixelsPerScanLine * 4;
+	fb.bgr = (info->PixelFormat == PixelBlueGreenRedReserved8BitPerColor);
 	fb.valid = 1;
 
 	serial_puts("[boot] GOP framebuffer base=");
@@ -354,6 +397,242 @@ static EFI_STATUS alloc_low(UINTN pages, EFI_PHYSICAL_ADDRESS *out)
 		g_low_alloc_next = addr + pages * PAGE_SIZE;
 	}
 	return status;
+}
+
+#define BOOT_PROMPT_BUF_SIZE 256
+
+/* Classic Darwin/boot.efi-style boot-args prompt: shown once, right before
+ * ExitBootServices, over the Simple Text Input/Output protocols the
+ * firmware already hands us (no new protocol dependency). Backspace edits
+ * the line; Enter on an empty line leaves *out untouched (empty string) so
+ * the caller's default command line is used as-is. */
+static void read_boot_args_prompt(EFI_SYSTEM_TABLE *SystemTable, char *out, UINTN out_size)
+{
+	EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *co = SystemTable->ConOut;
+	EFI_SIMPLE_TEXT_INPUT_PROTOCOL *ci = SystemTable->ConIn;
+
+	/* Best-effort: park the prompt near the bottom of the screen, matching
+	 * real boot.efi. Mode/QueryMode/SetCursorPosition are all optional
+	 * here (still falls back to wherever the cursor already is) since
+	 * some firmware/console combos don't implement them usefully. */
+	if (co->Mode && co->QueryMode && co->SetCursorPosition) {
+		UINTN cols = 0, rows = 0;
+		EFI_STATUS qstatus = co->QueryMode(co, (UINTN)co->Mode->Mode, &cols, &rows);
+		if (!EFI_ERROR(qstatus) && rows > 2) {
+			co->SetCursorPosition(co, 0, rows - 2);
+		}
+	}
+
+	co->OutputString(co, u"Boot arguments (Enter to continue):\r\n> ");
+
+	UINTN len = 0;
+	for (;;) {
+		EFI_INPUT_KEY key;
+		EFI_STATUS status;
+		do {
+			status = ci->ReadKeyStroke(ci, &key);
+			if (status == EFI_NOT_READY) {
+				gBS->Stall(10000); /* 10ms -- avoid busy-spinning the firmware */
+			}
+		} while (status == EFI_NOT_READY);
+
+		if (EFI_ERROR(status)) {
+			break;
+		}
+
+		if (key.UnicodeChar == u'\r' || key.UnicodeChar == u'\n') {
+			co->OutputString(co, u"\r\n");
+			break;
+		}
+
+		if (key.UnicodeChar == 8 || key.UnicodeChar == 0x7F) { /* backspace/DEL */
+			if (len > 0) {
+				len--;
+				co->OutputString(co, u"\b \b");
+			}
+			continue;
+		}
+
+		if (key.UnicodeChar >= 0x20 && key.UnicodeChar < 0x7F && len + 1 < out_size) {
+			CHAR16 ch[2] = {key.UnicodeChar, 0};
+			out[len++] = (char)key.UnicodeChar;
+			co->OutputString(co, ch);
+		}
+		/* everything else (arrows, function keys, ...) is ignored */
+	}
+	out[len] = 0;
+
+	serial_puts("[boot] user boot-args: \"");
+	serial_puts(out);
+	serial_puts("\"\n");
+}
+
+/* boot/splash.raw's format: a small fixed header followed by raw RGBA8
+ * pixel data (one byte each of R,G,B,A per pixel, row-major, no padding).
+ * Pre-resized on the host with a quality resampler by boot/gen_splash.py
+ * from boot/assets/splash_source.png -- deliberately NOT a PNG/JPEG: this
+ * bootloader has no decoder for either (no zlib inflate, no DCT), and
+ * writing one just to show a boot picture is out of scope. Shipping
+ * already-decoded, already-correctly-sized pixels means the loader only
+ * ever needs a straight memory copy. */
+typedef struct {
+	char magic[4]; /* "ASPL" */
+	uint32_t width;
+	uint32_t height;
+	uint32_t reserved;
+} splash_header_t;
+
+/* Centered, edge-clipped blit -- no scaling. Scaling a raster at boot time
+ * with anything simple (nearest-neighbor) is exactly the blocky look we're
+ * trying to avoid; boot/gen_splash.py already produced pixels sized for a
+ * typical GOP mode, so this only needs to handle the framebuffer being
+ * larger (letterbox with the existing black backdrop) or smaller (crop)
+ * than that -- both trivial without resampling. */
+static void blit_splash(const gop_fb_t *fb, const uint8_t *pixels, uint32_t sw, uint32_t sh)
+{
+	uint32_t dst_x0 = (fb->width > sw) ? (fb->width - sw) / 2 : 0;
+	uint32_t dst_y0 = (fb->height > sh) ? (fb->height - sh) / 2 : 0;
+	uint32_t src_x0 = (sw > fb->width) ? (sw - fb->width) / 2 : 0;
+	uint32_t src_y0 = (sh > fb->height) ? (sh - fb->height) / 2 : 0;
+	uint32_t copy_w = (sw < fb->width) ? sw : fb->width;
+	uint32_t copy_h = (sh < fb->height) ? sh : fb->height;
+
+	uint8_t *fb_base = (uint8_t *)(UINTN)fb->base;
+	for (uint32_t y = 0; y < copy_h; y++) {
+		const uint8_t *srow = pixels + ((uint64_t)(src_y0 + y) * sw + src_x0) * 4;
+		uint8_t *drow = fb_base + (uint64_t)(dst_y0 + y) * fb->rowBytes + (uint64_t)dst_x0 * 4;
+		for (uint32_t x = 0; x < copy_w; x++) {
+			uint8_t r = srow[0], g = srow[1], b = srow[2];
+			if (fb->bgr) {
+				drow[0] = b;
+				drow[1] = g;
+				drow[2] = r;
+			} else {
+				drow[0] = r;
+				drow[1] = g;
+				drow[2] = b;
+			}
+			drow[3] = 0;
+			srow += 4;
+			drow += 4;
+		}
+	}
+}
+
+/* Solid white bar, horizontally centered under the splash image -- a
+ * static "loading" indicator, not an animated one: this bootloader runs
+ * once, before ExitBootServices, with no visibility into how far the
+ * kernel/userland boot that follows has actually gotten, so there's no
+ * real progress fraction to draw. Clipped/skipped rather than drawn
+ * off-screen if the framebuffer is too short for it to fit below the
+ * image. */
+static void blit_loading_bar(const gop_fb_t *fb, uint32_t image_bottom_y)
+{
+	uint32_t bar_w = 320;
+	uint32_t bar_h = 10;
+	uint32_t margin_top = 28;
+
+	if (bar_w > fb->width) {
+		bar_w = fb->width;
+	}
+	uint32_t bar_x0 = (fb->width - bar_w) / 2;
+	uint32_t bar_y0 = image_bottom_y + margin_top;
+	if (bar_y0 + bar_h > fb->height) {
+		return; /* doesn't fit -- leave the splash alone rather than clip it oddly */
+	}
+
+	uint8_t *fb_base = (uint8_t *)(UINTN)fb->base;
+	for (uint32_t y = 0; y < bar_h; y++) {
+		uint8_t *drow = fb_base + (uint64_t)(bar_y0 + y) * fb->rowBytes + (uint64_t)bar_x0 * 4;
+		for (uint32_t x = 0; x < bar_w; x++) {
+			drow[0] = 0xFF;
+			drow[1] = 0xFF;
+			drow[2] = 0xFF;
+			drow[3] = 0;
+			drow += 4;
+		}
+	}
+}
+
+/* Loads \splash.raw from the ESP and blits it onto the already-located GOP
+ * framebuffer, then draws a loading bar under it. Returns 1 on success
+ * (caller should then select KBOOT_GRAPHICS_MODE), 0 on any failure
+ * (missing file, bad header, short read) so the caller can fall back to
+ * the always-visible text console instead of handing the user a blank
+ * black screen with no explanation. */
+static int load_and_blit_splash(EFI_FILE_PROTOCOL *root, const gop_fb_t *fb)
+{
+	EFI_FILE_PROTOCOL *file = 0;
+	EFI_STATUS status = root->Open(root, &file, (CHAR16 *)SPLASH_PATH_U16, EFI_FILE_MODE_READ, 0);
+	if (EFI_ERROR(status)) {
+		serial_puts("[boot] splash.raw not found, skipping splash\n");
+		return 0;
+	}
+
+	uint8_t info_buf[512];
+	UINTN info_size = sizeof(info_buf);
+	EFI_GUID file_info_guid = EFI_FILE_INFO_GUID;
+	status = file->GetInfo(file, &file_info_guid, &info_size, info_buf);
+	if (EFI_ERROR(status)) {
+		serial_puts("[boot] GetInfo(splash.raw) failed\n");
+		file->Close(file);
+		return 0;
+	}
+	UINTN file_size = (UINTN)((EFI_FILE_INFO *)info_buf)->FileSize;
+	if (file_size <= sizeof(splash_header_t)) {
+		serial_puts("[boot] splash.raw too small\n");
+		file->Close(file);
+		return 0;
+	}
+
+	void *buf = 0;
+	status = gBS->AllocatePool(EfiLoaderData, file_size, &buf);
+	if (EFI_ERROR(status) || !buf) {
+		serial_puts("[boot] AllocatePool(splash) failed\n");
+		file->Close(file);
+		return 0;
+	}
+
+	UINTN n = file_size;
+	status = file->Read(file, &n, buf);
+	file->Close(file);
+	if (EFI_ERROR(status) || n != file_size) {
+		serial_puts("[boot] Read(splash.raw) failed\n");
+		gBS->FreePool(buf);
+		return 0;
+	}
+
+	splash_header_t *hdr = (splash_header_t *)buf;
+	if (hdr->magic[0] != 'A' || hdr->magic[1] != 'S' || hdr->magic[2] != 'P' || hdr->magic[3] != 'L') {
+		serial_puts("[boot] splash.raw bad magic\n");
+		gBS->FreePool(buf);
+		return 0;
+	}
+
+	UINTN pixel_bytes = (UINTN)hdr->width * (UINTN)hdr->height * 4;
+	if (file_size - sizeof(splash_header_t) < pixel_bytes) {
+		serial_puts("[boot] splash.raw truncated\n");
+		gBS->FreePool(buf);
+		return 0;
+	}
+
+	serial_puts("[boot] blitting splash ");
+	serial_puthex64(hdr->width);
+	serial_puts("x");
+	serial_puthex64(hdr->height);
+	serial_puts("\n");
+	blit_splash(fb, (const uint8_t *)(hdr + 1), hdr->width, hdr->height);
+
+	/* Same centering math as blit_splash's dst_y0 -- recomputed here
+	 * rather than threaded back out through a return value, to find
+	 * where the image's bottom edge actually landed (letterboxed,
+	 * cropped, or exact) so the bar goes directly under it. */
+	uint32_t dst_y0 = (fb->height > hdr->height) ? (fb->height - hdr->height) / 2 : 0;
+	uint32_t copy_h = (hdr->height < fb->height) ? hdr->height : fb->height;
+	blit_loading_bar(fb, dst_y0 + copy_h);
+
+	gBS->FreePool(buf);
+	return 1;
 }
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
@@ -620,6 +899,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 		serial_puts("\n");
 	}
 
+	/* ---- interactive boot-args prompt: kernel + RAMDisk are loaded, boot
+	 * services (and thus the console) are still up, and we haven't touched
+	 * the default command line yet -- exactly the classic boot.efi moment
+	 * for this. An empty line (bare Enter) leaves user_boot_args empty, so
+	 * the default command line below is used unmodified. */
+	char user_boot_args[BOOT_PROMPT_BUF_SIZE];
+	read_boot_args_prompt(SystemTable, user_boot_args, sizeof(user_boot_args));
+
 	/* ---- minimal device tree: root -> chosen(random-seed) -> memory-map
 	 * (RAMDisk).
 	 *
@@ -740,14 +1027,53 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 		 * unconditionally, independent of cons_ops_index, so serial stays
 		 * a live kernel debug log for the whole boot regardless of what
 		 * the graphical console is doing. */
-		const char *cmdline = "-v keepsyms=1 debug=0x14C rd=md0 vti=0 serial=2";
-		UINTN n = strlen_(cmdline);
+		/* No "-v" here on purpose: verbosity is now the prompt's call (see
+		 * read_boot_args_prompt above and the KBOOT_GRAPHICS_MODE/splash
+		 * selection below) -- a bare Enter should mean a quiet, splash-
+		 * screen boot, not a forced-verbose one. */
+		/* vm_compressor=2 (VM_PAGER_COMPRESSOR_NO_SWAP, osfmk/vm/vm_pageout.h):
+		 * in-RAM compressor only, no disk-swap backend. The default
+		 * (VM_PAGER_COMPRESSOR_WITH_SWAP) has the compressor try to create
+		 * /private/var/vm/swapfileN on the root filesystem -- nonsensical
+		 * here since root is itself a RAMDisk (compressing pages just to
+		 * write them onto more RAM pretending to be a disk), and it fails
+		 * outright anyway: bsd/miscfs/fat16lite has no vnode_setsize/
+		 * preallocate support, which swap file creation requires. Without
+		 * this, that failure is merely noisy (retried lazily, never
+		 * blocks boot -- see vm_swap_create_file's callers), but there's
+		 * no reason to let it try something that can't work. */
+		const char *default_cmdline = "keepsyms=1 debug=0x14C rd=md0 vti=0 serial=2 vm_compressor=2";
+		UINTN n = strlen_(default_cmdline);
 		if (n >= BOOT_LINE_LENGTH) {
 			n = BOOT_LINE_LENGTH - 1;
 		}
-		bcopy_(cmdline, ba->CommandLine, n);
+		bcopy_(default_cmdline, ba->CommandLine, n);
+
+		/* Append rather than replace: rd=md0/serial=2/etc above are load-
+		 * bearing (see the comments just below), so a user-entered "-v" or
+		 * "keepsyms=1" at the prompt extends the default line instead of
+		 * losing them. */
+		UINTN user_len = strlen_(user_boot_args);
+		if (user_len > 0 && n < BOOT_LINE_LENGTH - 1) {
+			ba->CommandLine[n++] = ' ';
+			UINTN avail = BOOT_LINE_LENGTH - 1 - n;
+			if (user_len > avail) {
+				user_len = avail;
+			}
+			bcopy_(user_boot_args, ba->CommandLine + n, user_len);
+			n += user_len;
+		}
 		ba->CommandLine[n] = 0;
+
+		serial_puts("[boot] final CommandLine: \"");
+		serial_puts(ba->CommandLine);
+		serial_puts("\"\n");
 	}
+	/* "-v" is a whole boot-arg token, same as xnu's own parser -- checked
+	 * against the final, already-appended CommandLine so it doesn't matter
+	 * whether it came from the default or the user typed it at the
+	 * prompt. */
+	int verbose = cmdline_has_token(ba->CommandLine, "-v");
 	if (gop_fb.valid) {
 		/* pe_init.c's PE_init_platform() prefers ba->Video (the
 		 * "new EFI-style" struct) over VideoV1 whenever v_baseAddr != 0,
@@ -760,7 +1086,36 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 		ba->Video.v_width = gop_fb.width;
 		ba->Video.v_height = gop_fb.height;
 		ba->Video.v_depth = 32;
-		ba->Video.v_display = KBOOT_FB_TEXT_MODE;
+
+		/* Quiet boot (no "-v"): paint the splash + a loading bar and use
+		 * KBOOT_GRAPHICS_MODE so xnu's console leaves it alone while
+		 * boot runs.
+		 *
+		 * GRAPHICS_MODE used to be a one-way trip in this kernel:
+		 * kernel_bootstrap_thread()'s one-shot initialize_screen(NULL,
+		 * kPEAcquireScreen) call (the AsterOS addition that stands in
+		 * for a real IOFramebuffer driver attaching) latches
+		 * disableConsoleOutput = TRUE for that mode, and nothing ever
+		 * called kPETextScreen to undo it -- there's no WindowServer/
+		 * loginwindow here to reveal the shell once boot finishes the
+		 * way real macOS's boot picture does. That's now fixed on the
+		 * userland side instead: launchd (userland/launchd/launchd.c)
+		 * writes to the kern.consoletext sysctl (bsd/kern/kern_sysctl.c)
+		 * right before starting the shell daemon, which calls
+		 * initialize_screen(NULL, kPETextScreen) and un-hides the
+		 * console at exactly the right moment. So it's safe to hide
+		 * text behind the splash here again. */
+		if (!verbose) {
+			/* Wipe whatever firmware boot-log text and our own prompt
+			 * left on the (text-mode, but GOP-backed) console before
+			 * painting pixels directly -- otherwise stray characters from
+			 * earlier in boot sit on top of/near the splash. */
+			if (SystemTable->ConOut->ClearScreen) {
+				SystemTable->ConOut->ClearScreen(SystemTable->ConOut);
+			}
+			load_and_blit_splash(root, &gop_fb);
+		}
+		ba->Video.v_display = !verbose ? KBOOT_GRAPHICS_MODE : KBOOT_FB_TEXT_MODE;
 	}
 
 	ba->deviceTreeP = (uint32_t)dt_phys;
