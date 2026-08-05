@@ -49,6 +49,22 @@ for f in "$LIBC_SRC"/musl_math/*.c; do
 	OBJS+=("$OUT/$base.o")
 done
 
+# Real Apple BlocksRuntime (_Block_copy/_Block_release, and the
+# _NSConcreteStackBlock/_NSConcreteMallocBlock/_NSConcreteGlobalBlock data
+# symbols clang's -fblocks codegen references directly by address for a
+# block literal's `isa` field) -- same vendored source + config.h already
+# proven to cross-compile clean for this exact target via
+# userland/ld64_shim/build.sh, just linked into the real OS's libSystem
+# now instead of only the host-side ld64 tool. Real Darwin ships these
+# symbols as part of libSystem too, not a separate dylib.
+BLOCKSRT_DIR="$ROOT/src/llvm-project/compiler-rt/lib/BlocksRuntime"
+BLOCKSRT_CFLAGS=("${CFLAGS[@]}" -fblocks -I "$ROOT/userland/libSystem/blocksruntime_cfg" -Wno-deprecated-declarations)
+for f in "$BLOCKSRT_DIR/runtime.c" "$BLOCKSRT_DIR/data.c"; do
+	base=$(basename "${f%.*}")
+	"$CLANG" "${BLOCKSRT_CFLAGS[@]}" -c "$f" -o "$OUT/$base.o"
+	OBJS+=("$OUT/$base.o")
+done
+
 # The host's ld64 hard-refuses to link a dylib with itself, and also
 # hard-refuses to build any dynamic Mach-O with an empty dependency list
 # at all (see userland/dyld/build.sh's own placeholder for the first time

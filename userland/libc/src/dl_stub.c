@@ -57,20 +57,16 @@ sysctl(int *name, unsigned int namelen, void *oldp, size_t *oldlenp, void *newp,
 		}
 		return 0;
 	}
-	if (namelen == 2 && name[0] == CTL_HW && name[1] == HW_NCPU) {
-		/* Honestly 1: pthread_create() always returns EAGAIN here (see
-		 * pthread_stub.c), so no extra worker thread ld64 might spawn
-		 * based on this count could ever actually run. */
-		static const int ncpu = 1;
-		if (oldp && oldlenp) {
-			size_t n = sizeof(ncpu) < *oldlenp ? sizeof(ncpu) : *oldlenp;
-			memcpy(oldp, &ncpu, n);
-			*oldlenp = sizeof(ncpu);
-		}
-		return 0;
-	}
-	errno = ENOTSUP;
-	return -1;
+	/* Anything else (notably CTL_HW/HW_NCPU) is routed through the real
+	 * SYS_sysctl(202) syscall instead of a canned answer. xnu's own stock
+	 * bsd/kern/kern_mib.c genuinely implements hw.ncpu -- this used to be
+	 * hardcoded to 1 with a comment claiming pthread_create() always
+	 * failed (true before Phase 16, false now that real kernel-scheduled
+	 * pthreads exist), which left GCD's worker pool with no real core
+	 * count to size itself off. Same real-round-trip pattern
+	 * sysctlbyname() already uses below. */
+	return (int)sys_result(raw_syscall6(SYS_sysctl, (long)name, (long)namelen,
+	    (long)oldp, (long)oldlenp, (long)newp, (long)newlen));
 }
 
 /* Unlike sysctl() above (still a hand-picked-OID stub -- fine for its

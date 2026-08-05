@@ -64,6 +64,9 @@ fi
 if [ -f build/Foundation_obj/foundationtest ]; then
 	mcopy -i "$ROOTFS_IMG" userland/launchd/daemons/com.asteros.foundationtest.plist ::/etc/launchd/daemons/com.asteros.foundationtest.plist
 fi
+if [ -f build/dispatch_obj/dispatchtest ]; then
+	mcopy -i "$ROOTFS_IMG" userland/launchd/daemons/com.asteros.dispatchtest.plist ::/etc/launchd/daemons/com.asteros.dispatchtest.plist
+fi
 
 DYLD_BIN="build/dyld_obj/dyld"
 LIBSYSTEM_REAL="build/libSystem_obj/libSystem.B.dylib"
@@ -102,6 +105,11 @@ if [ -f "$DYLD_BIN" ]; then
 		echo "Foundation found in build/ -- including it in the rootfs"
 		mcopy -i "$ROOTFS_IMG" build/Foundation_obj/libFoundation.dylib ::/usr/lib/libFoundation.dylib
 		mcopy -i "$ROOTFS_IMG" build/Foundation_obj/foundationtest ::/bin/foundationtest
+	fi
+	if [ -f build/dispatch_obj/libdispatch.dylib ] && [ -f build/dispatch_obj/dispatchtest ]; then
+		echo "libdispatch found in build/ -- including it in the rootfs"
+		mcopy -i "$ROOTFS_IMG" build/dispatch_obj/libdispatch.dylib ::/usr/lib/libdispatch.dylib
+		mcopy -i "$ROOTFS_IMG" build/dispatch_obj/dispatchtest ::/bin/dispatchtest
 	fi
 fi
 

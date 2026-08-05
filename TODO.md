@@ -1158,6 +1158,125 @@ on every respawn from a from-scratch `libFoundation.dylib` +
 reconfirmed passing with Foundation's dylib and daemon present in the
 full system (no regression), per the scheduling-fairness caveat above.
 
+## Phase 19 — libdispatch (GCD): DONE, verified live
+`userland/libdispatch/` — a real v1-scoped GCD, own `libdispatch.dylib`
+depending only on `libSystem.B.dylib` (same per-component pattern as
+CoreFoundation/Foundation, not folded into `libSystem` the way real
+Darwin's libdispatch symbols are). In: `dispatch_queue_t` (serial +
+concurrent, `dispatch_queue_create`/`dispatch_get_main_queue`/
+`dispatch_get_global_queue`), `dispatch_async`/`dispatch_sync` (+ `_f`
+function-pointer twins), `dispatch_once`, `dispatch_semaphore_t`,
+`dispatch_group_t` (`_async`/`_enter`/`_leave`/`_wait`/`_notify`),
+`dispatch_time`/`dispatch_walltime`/`dispatch_after`. Built on real
+kernel-scheduled pthreads (Phase 16), not xnu's actual workqueue/kevent
+machinery.
+
+Two real prerequisites, fixed at the root, not worked around:
+1. `libc`'s `sysctl()` (`dl_stub.c`) had `HW_NCPU` hardcoded to 1 with a
+   stale comment ("`pthread_create()` always returns EAGAIN" — true before
+   Phase 16, false since). Real xnu's stock `bsd/kern/kern_mib.c`
+   genuinely implements `hw.ncpu`; `sysctl()` now routes through a real
+   `SYS_sysctl` round-trip (same pattern `sysctlbyname()` already used
+   two functions below it), so the worker pool sizes off a real core
+   count instead of a canned answer.
+2. Apple's real BlocksRuntime source (`_Block_copy`/`_Block_release`,
+   `_NSConcreteStackBlock`/`_NSConcreteMallocBlock`/`_NSConcreteGlobalBlock`
+   — the data symbols clang's `-fblocks` codegen references directly for a
+   block literal's `isa` field) was already vendored and cross-compiling
+   clean for this exact target (`userland/ld64_shim/build.sh`, only linked
+   into the host-side `ld64` tool). Its `config.h` moved to a shared
+   location (`userland/libSystem/blocksruntime_cfg/`) and the same two
+   files now also build into `libSystem.B.dylib` itself, matching where
+   real Darwin ships them. Cross-dylib *data* symbol binding (not just
+   function stubs) was already proven end-to-end by
+   `userland/dyld/test/`'s own extern-data test before this phase touched
+   it, so no dyld changes were needed.
+
+**The one real, non-obvious bug this phase found, worth remembering if
+anything else ever spawns a background helper thread that calls
+`nanosleep()`:** the timer thread backing `dispatch_after` (a
+sorted-deadline list + polling `nanosleep()`) intermittently never woke up
+— `dispatch_after`'s block just never fired, caught by `dispatchtest`'s own
+`DISPATCHTEST FAIL: dispatch_after fired within timeout`. Root cause,
+ground-truthed against `src/xnu/bsd/kern/kern_time.c`'s `realitexpire()`:
+this tree's `nanosleep()` (`userland/libc/src/time.c`) is a real,
+not-a-stub implementation, but built on a **process-wide** `ITIMER_REAL` +
+`SIGALRM` + `sigsuspend()` — and `realitexpire()` delivers that SIGALRM via
+`psignal()`, a process-directed signal with no guarantee it lands on the
+specific thread blocked in `sigsuspend()` rather than any other live
+thread in the process (e.g. one of the worker pool's). Every prior caller
+of `nanosleep()` in this tree only ever had one thread actually sleeping
+at a time, so this was latent, not previously observable. `sched_yield()`
+is also a documented no-op stub in this tree (no cheap kernel yield
+primitive wired up). Fix: the timer thread's poll loop spin-waits (`pause`
++ a `clock_gettime`-based deadline check) instead of calling `nanosleep()`
+at all — same tradeoff `pthread_mutex_t`/`pthread_cond_timedwait` already
+make (correct under the real preemptive scheduler, not maximally
+CPU-efficient), not a new one. `nanosleep()` itself was not changed —
+still correct for its existing single-relevant-thread callers (launchd's
+throttle sleep, etc.); the fix was to stop relying on it from a background
+thread instead.
+
+Scheduling invariant (a serial queue never drains two items at once) is
+enforced without a dedicated thread per queue: whichever pool worker
+starts draining a serial queue holds `draining` for the queue's *entire*
+backlog, not one item at a time, so a `dispatch_async` arriving mid-drain
+sees `draining` set and skips scheduling a new runnable-list entry — the
+drainer picks the new item up itself on its next lock acquisition, no
+missed wakeup. Concurrent queues skip the gate entirely (one runnable-list
+entry per pushed item). `dispatch_sync` always enqueues and blocks on a
+private semaphore, with one real safety addition beyond ABI parity: a
+thread-local "queue I'm currently draining" check (real
+`pthread_key_create`/`pthread_setspecific`, not a stub) that aborts with a
+diagnostic instead of silently hanging if a thread `dispatch_sync`s onto a
+queue it's already draining.
+
+**Known v1 limitations (documented, not oversights):** no `dispatch_
+source_t` (needs `kevent`/`kqueue`, which nothing in this tree wires up to
+a syscall anywhere yet — confirmed by grep before starting this phase);
+no `dispatch_io`/`dispatch_data`; no real QoS-differentiated scheduling
+(`dispatch_get_global_queue`'s priority argument is accepted, ignored —
+every global queue shares one worker pool); no mach-port-based queue
+wakeup. `dispatch_get_main_queue()` is an ordinary auto-draining serial
+queue, not the real runloop-attached main queue (no `CFRunLoop`/dispatch-
+source integration to hook it to yet) — `dispatch_main()` just parks the
+calling thread forever (matching the real "never returns" ABI contract)
+while blocks submitted to the main queue actually run on whichever pool
+worker drains it, not the thread that called `dispatch_main()`.
+
+**A latent, out-of-scope-for-this-phase finding, not chased:**
+`userland/libc/src/syscall_raw.h`'s `g_syscall_cf` (the carry-flag scratch
+variable `sys_result()` reads to detect a syscall error) is a plain
+`static` per translation unit, not thread-local — genuinely racy if two
+threads both make syscalls defined in the *same* `.c` file concurrently
+(e.g. two `syscalls.c`-defined calls interleaving). Every prior real-
+pthread phase (16-18) never stressed this because their test daemons'
+concurrent work stayed inside userland spinlocks, not concurrent raw
+syscalls; `dispatchtest`'s worker pool is the first genuinely concurrent
+syscall-heavy consumer, and no corruption was observed in repeated runs —
+but it's a real, not theoretical, race, same "document, don't chase"
+precedent as the fat16lite bugs and the launchd scheduling-fairness gap in
+Phase 18. Worth a real fix (removing the shared-mutable-global scratch
+entirely, not thread-localizing it) if it ever manifests as flakiness.
+
+**Verified live in QEMU:** `userland/libdispatch/test/dispatchtest.c`
+exercises serial-queue FIFO ordering, `dispatch_sync` (including a real
+`__block` byref-captured variable, proving the Blocks runtime's byref
+descriptor copy/dispose path works, not just plain captures),
+`dispatch_once` racing 8 real concurrent threads down to exactly one run,
+`dispatch_async_f`, `dispatch_after` (fired at 647ms and 221ms across two
+independent runs against a 200ms target, well inside its 2s test
+timeout), `dispatch_group_notify`, and — in the same spirit as
+`pthread_test`'s own 4-thread exact-counter check — 4 concurrent
+`dispatch_async`s onto the global concurrent queue, 50,000 increments each
+under a `dispatch_semaphore_t`, landing on an exact 200,000 with zero lost
+updates. Installed as a `launchd` daemon
+(`com.asteros.dispatchtest.plist`) and confirmed via repeated QEMU monitor
+`screendump` captures showing `DISPATCHTEST PASS`, both at boot and via a
+fresh interactive re-run from the shell; `cftest`/`pthreadtest`/
+`foundationtest` independently reconfirmed passing in the same full
+system (no regression).
+
 ## Known deviations from a literal reading of the task (documented, not oversights)
 - ~~BusyBox → our own tiny multicall static binary~~ — superseded, see Phase 9 above.
 - ~~Root filesystem → MOCKFS + RAMDisk~~ — superseded: the actual root filesystem is

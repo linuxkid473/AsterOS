@@ -519,43 +519,90 @@ static void blit_splash(const gop_fb_t *fb, const uint8_t *pixels, uint32_t sw, 
 	}
 }
 
-/* Solid white bar, horizontally centered under the splash image -- a
- * static "loading" indicator, not an animated one: this bootloader runs
- * once, before ExitBootServices, with no visibility into how far the
- * kernel/userland boot that follows has actually gotten, so there's no
- * real progress fraction to draw. Clipped/skipped rather than drawn
- * off-screen if the framebuffer is too short for it to fit below the
- * image. */
-static void blit_loading_bar(const gop_fb_t *fb, uint32_t image_bottom_y)
+/* Twelve-dot spinner, horizontally centered under the splash image -- an
+ * indeterminate "loading" indicator: this bootloader runs once, before
+ * ExitBootServices, with no visibility into how far the kernel/userland
+ * boot that follows has actually gotten, so there was never a real
+ * progress fraction to draw (the bar this replaced was static for exactly
+ * that reason). A spinner doesn't need one either, it just needs to keep
+ * moving, so it plays for a fixed short stretch here instead of sitting
+ * on screen as a dead image. Skipped rather than drawn off-screen/clipped
+ * if the framebuffer is too small to fit the ring below the splash. */
+#define SPINNER_DOT_COUNT      (12)
+#define SPINNER_DOT_RADIUS     (3)
+#define SPINNER_RING_RADIUS    (18)
+#define SPINNER_FRAME_COUNT    (24)   /* two full laps */
+#define SPINNER_FRAME_STALL_US (70000)
+
+/* cos/sin of i * 30 degrees, fixed point (unit circle * 256) */
+static const int32_t spinner_dx256[SPINNER_DOT_COUNT] = {
+	 256,  222,  128,    0, -128, -222, -256, -222, -128,    0,  128,  222
+};
+static const int32_t spinner_dy256[SPINNER_DOT_COUNT] = {
+	   0,  128,  222,  256,  222,  128,    0, -128, -222, -256, -222, -128
+};
+
+static void put_gray_pixel(const gop_fb_t *fb, uint32_t x, uint32_t y, uint8_t v)
 {
-	uint32_t bar_w = 320;
-	uint32_t bar_h = 10;
-	uint32_t margin_top = 28;
+	uint8_t *drow = (uint8_t *)(UINTN)fb->base + (uint64_t)y * fb->rowBytes + (uint64_t)x * 4;
+	drow[0] = v;
+	drow[1] = v;
+	drow[2] = v;
+	drow[3] = 0;
+}
 
-	if (bar_w > fb->width) {
-		bar_w = fb->width;
-	}
-	uint32_t bar_x0 = (fb->width - bar_w) / 2;
-	uint32_t bar_y0 = image_bottom_y + margin_top;
-	if (bar_y0 + bar_h > fb->height) {
-		return; /* doesn't fit -- leave the splash alone rather than clip it oddly */
+/* headIndex is which dot is brightest; the rest fade out going backwards
+ * around the ring, same comet-tail look as any indeterminate spinner. */
+static void blit_spinner_frame(const gop_fb_t *fb, uint32_t cx, uint32_t cy, int headIndex)
+{
+	uint32_t half = SPINNER_RING_RADIUS + SPINNER_DOT_RADIUS + 2;
+	uint32_t box_x0 = cx - half;
+	uint32_t box_y0 = cy - half;
+
+	/* repaint the whole box black first -- the backdrop here is
+	 * guaranteed flat black (same assumption blit_splash's letterboxing
+	 * already relies on), so this is a cheap full erase rather than
+	 * needing to save/restore whatever was there before */
+	for (uint32_t y = 0; y < half * 2; y++) {
+		bzero_((uint8_t *)(UINTN)fb->base + (uint64_t)(box_y0 + y) * fb->rowBytes + (uint64_t)box_x0 * 4,
+		       (UINTN)half * 2 * 4);
 	}
 
-	uint8_t *fb_base = (uint8_t *)(UINTN)fb->base;
-	for (uint32_t y = 0; y < bar_h; y++) {
-		uint8_t *drow = fb_base + (uint64_t)(bar_y0 + y) * fb->rowBytes + (uint64_t)bar_x0 * 4;
-		for (uint32_t x = 0; x < bar_w; x++) {
-			drow[0] = 0xFF;
-			drow[1] = 0xFF;
-			drow[2] = 0xFF;
-			drow[3] = 0;
-			drow += 4;
+	for (int i = 0; i < SPINNER_DOT_COUNT; i++) {
+		int dotIndex = (i - headIndex + SPINNER_DOT_COUNT) % SPINNER_DOT_COUNT;
+		uint8_t brightness = (uint8_t)(0xFF - ((0xFF * dotIndex) / (SPINNER_DOT_COUNT - 1)));
+		int32_t dcx = (int32_t)cx + ((SPINNER_RING_RADIUS * spinner_dx256[i]) / 256);
+		int32_t dcy = (int32_t)cy + ((SPINNER_RING_RADIUS * spinner_dy256[i]) / 256);
+
+		for (int y = -SPINNER_DOT_RADIUS; y <= SPINNER_DOT_RADIUS; y++) {
+			for (int x = -SPINNER_DOT_RADIUS; x <= SPINNER_DOT_RADIUS; x++) {
+				if (x * x + y * y <= SPINNER_DOT_RADIUS * SPINNER_DOT_RADIUS) {
+					put_gray_pixel(fb, (uint32_t)(dcx + x), (uint32_t)(dcy + y), brightness);
+				}
+			}
 		}
 	}
 }
 
+static void blit_loading_spinner(const gop_fb_t *fb, uint32_t image_bottom_y)
+{
+	uint32_t margin_top = 18;
+	uint32_t half = SPINNER_RING_RADIUS + SPINNER_DOT_RADIUS + 2;
+	uint32_t cx = fb->width / 2;
+	uint32_t cy = image_bottom_y + margin_top + half;
+
+	if (half > fb->width / 2 || cy + half > fb->height) {
+		return; /* doesn't fit -- leave the splash alone rather than clip it oddly */
+	}
+
+	for (int frame = 0; frame < SPINNER_FRAME_COUNT; frame++) {
+		blit_spinner_frame(fb, cx, cy, frame % SPINNER_DOT_COUNT);
+		gBS->Stall(SPINNER_FRAME_STALL_US);
+	}
+}
+
 /* Loads \splash.raw from the ESP and blits it onto the already-located GOP
- * framebuffer, then draws a loading bar under it. Returns 1 on success
+ * framebuffer, then plays a loading spinner under it. Returns 1 on success
  * (caller should then select KBOOT_GRAPHICS_MODE), 0 on any failure
  * (missing file, bad header, short read) so the caller can fall back to
  * the always-visible text console instead of handing the user a blank
@@ -626,10 +673,10 @@ static int load_and_blit_splash(EFI_FILE_PROTOCOL *root, const gop_fb_t *fb)
 	/* Same centering math as blit_splash's dst_y0 -- recomputed here
 	 * rather than threaded back out through a return value, to find
 	 * where the image's bottom edge actually landed (letterboxed,
-	 * cropped, or exact) so the bar goes directly under it. */
+	 * cropped, or exact) so the spinner goes directly under it. */
 	uint32_t dst_y0 = (fb->height > hdr->height) ? (fb->height - hdr->height) / 2 : 0;
 	uint32_t copy_h = (hdr->height < fb->height) ? hdr->height : fb->height;
-	blit_loading_bar(fb, dst_y0 + copy_h);
+	blit_loading_spinner(fb, dst_y0 + copy_h);
 
 	gBS->FreePool(buf);
 	return 1;
@@ -1087,7 +1134,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 		ba->Video.v_height = gop_fb.height;
 		ba->Video.v_depth = 32;
 
-		/* Quiet boot (no "-v"): paint the splash + a loading bar and use
+		/* Quiet boot (no "-v"): paint the splash + a loading spinner and use
 		 * KBOOT_GRAPHICS_MODE so xnu's console leaves it alone while
 		 * boot runs.
 		 *

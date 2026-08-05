@@ -142,6 +142,57 @@ exposed a real, previously-latent launchd/kernel scheduling-fairness gap
 that only a slow-enough daemon could reveal. Also documented rather than
 chased this phase.
 
+## Decision: libdispatch scope (see TODO.md Phase 19)
+`userland/libdispatch/` is a real v1-scoped GCD -- genuine `dispatch_queue_t`
+(serial + concurrent), `dispatch_async`/`dispatch_sync`, `dispatch_once`,
+`dispatch_semaphore_t`, `dispatch_group_t`, and `dispatch_after` -- built on
+real kernel-scheduled pthreads (Phase 16) rather than xnu's actual
+workqueue/kevent machinery. Own dylib (`libdispatch.dylib`, depends on
+`libSystem.B.dylib`), same per-component pattern as CoreFoundation/
+Foundation, not folded into `libSystem` the way real Darwin's libdispatch
+symbols are -- consistent with this tree already keeping CF/Foundation as
+their own dylibs instead of one big libSystem umbrella.
+
+Two real prerequisites this phase needed and fixed at the root: `libc`'s
+`sysctl()` had `HW_NCPU` hardcoded to 1 (stale -- pthread_create() only
+started working for real in Phase 16), now routed through the real
+`SYS_sysctl` syscall so the worker pool can size itself off an actual core
+count; and Apple's real BlocksRuntime source (`_Block_copy`/
+`_NSConcreteStackBlock` etc., already vendored for the host-side `ld64`
+tool) is now also linked into `libSystem.B.dylib` itself, matching where
+real Darwin ships it -- proven safe by the fact that cross-dylib *data*
+symbol binding (what a block literal's `isa` field needs) was already
+exercised end-to-end by `userland/dyld/test/`'s own extern-data test.
+
+Scheduling invariant (a serial queue never drains two items at once) is
+enforced without a dedicated thread per queue: whichever pool worker starts
+draining a serial queue holds it for its *entire* backlog, not one item at
+a time, so a concurrent `dispatch_async` onto that queue can safely skip
+scheduling a new runnable-list entry while it sees the queue already
+draining -- the drainer will pick up the new item itself on its next lock
+acquisition. Concurrent queues skip this gate entirely (one runnable-list
+entry per item, any worker may run one independently). `dispatch_sync`
+always enqueues and blocks on a private semaphore -- cheap here since the
+semaphore itself is `pthread_mutex`/`pthread_cond`-backed, not a real
+syscall block -- with one real safety addition beyond ABI parity: a
+thread-local "queue I'm currently draining" check (via real
+`pthread_key_create`/`pthread_setspecific`) that aborts with a diagnostic
+instead of silently hanging a QEMU test daemon if a thread `dispatch_sync`s
+onto a queue it's already draining.
+
+Deliberately out of v1 scope, documented not overlooked: `dispatch_source_t`
+(needs kqueue/`kevent`, which nothing in this tree wires up to a syscall
+anywhere yet -- `dispatch_after` is backed by a plain timer thread polling a
+sorted-deadline list instead of a real `EVFILT_TIMER` source), `dispatch_io`/
+`dispatch_data`, real QoS-differentiated scheduling (`dispatch_get_global_
+queue`'s priority argument is accepted, ignored -- every global queue shares
+one worker pool), and mach-port-based queue wakeup. `dispatch_get_main_queue()`
+is also v1-simplified to an ordinary auto-draining serial queue rather than
+the real runloop-attached main queue -- there's no `CFRunLoop`/dispatch-source
+integration to hook it to yet -- so `dispatch_main()` just parks the calling
+thread forever (matching the real "never returns" ABI contract) while blocks
+submitted to the main queue actually run on whichever pool worker drains it.
+
 ## Decision: root filesystem = MOCKFS + in-memory RAMDisk (no disk driver at all)
 Investigated three options:
 1. **Real disk (AHCI/NVMe) + HFS+.** Apple's AHCI/NVMe storage kexts are NOT open source; ravynOS had to write their own AHCI driver from scratch (~6 months of effort) to get this far. HFS+ itself is also a separate kext, not statically linkable without patches. Rejected — out of scope for "smallest possible" system, and user explicitly said to skip this (no AHCI).

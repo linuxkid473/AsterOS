@@ -41,7 +41,10 @@ CFLAGS=(--target=x86_64-apple-macos10.15
 	-Wno-unused-parameter -fno-color-diagnostics -g -O0)
 
 BLOCKSRT_DIR="$ROOT/src/llvm-project/compiler-rt/lib/BlocksRuntime"
-BLOCKSRT_CFLAGS=("${CFLAGS[@]}" -I "$ROOT/userland/ld64_shim/blocksruntime_cfg" -Wno-deprecated-declarations)
+# Shared config.h -- see userland/libSystem/blocksruntime_cfg/config.h's
+# own header comment (also used to build the real BlocksRuntime into
+# libSystem.B.dylib now, not just this host-side tool).
+BLOCKSRT_CFLAGS=("${CFLAGS[@]}" -I "$ROOT/userland/libSystem/blocksruntime_cfg" -Wno-deprecated-declarations)
 
 FAIL=0
 compile_one() {

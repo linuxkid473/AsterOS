@@ -4,9 +4,15 @@
  * GCC/clang __sync builtin path rather than the deprecated userspace
  * OSAtomicCompareAndSwap* API (which the current SDK headers no longer
  * declare -- only the kernel-side libkern/OSAtomic.h names survive).
+ *
+ * Shared by both userland/ld64_shim/build.sh (the host-side ld64 tool)
+ * and userland/libSystem/build.sh (the real libSystem.B.dylib, which is
+ * where _Block_copy/_NSConcreteStackBlock etc. actually need to live for
+ * any OS component -- libdispatch included -- to use Blocks), rather
+ * than duplicated per consumer.
  */
-#ifndef _LD64_BLOCKSRUNTIME_CONFIG_H_
-#define _LD64_BLOCKSRUNTIME_CONFIG_H_
+#ifndef _BLOCKSRUNTIME_CONFIG_H_
+#define _BLOCKSRUNTIME_CONFIG_H_
 
 #define HAVE_SYNC_BOOL_COMPARE_AND_SWAP_INT 1
 #define HAVE_SYNC_BOOL_COMPARE_AND_SWAP_LONG 1
